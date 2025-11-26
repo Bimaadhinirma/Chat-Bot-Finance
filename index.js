@@ -3,6 +3,8 @@ const qrcode = require('qrcode-terminal');
 const financeManager = require('./financeManager');
 const { aiDecideAction } = require('./aiParser');
 const BackupManager = require('./backupManager');
+const chartGenerator = require('./chartGenerator');
+const excelExporter = require('./excelExporter');
 require('dotenv').config();
 
 // Chat history storage per user (max 10 messages)
@@ -270,14 +272,33 @@ client.on('message', async (msg) => {
                 addToChatHistory(userId, response, 'bot');
             }
             else if (decision.action === 'show_history') {
-                const txHistory = await financeManager.getHistory(userId, 10);
+                const period = decision.params?.period || 'today';
+                const yearMonth = decision.params?.month || null;
+                const limit = decision.params?.limit || 10;
+                
+                const txHistory = await financeManager.getHistoryByPeriod(userId, period, yearMonth, limit);
                 
                 if (txHistory.length === 0) {
-                    await msg.reply('📋 *Riwayat Transaksi*\n\nBelum ada transaksi.');
+                    const periodLabels = {
+                        'today': 'Hari Ini',
+                        'this_month': 'Bulan Ini',
+                        'last_month': 'Bulan Lalu',
+                        'all_time': 'Seluruh Periode',
+                        'specific_month': yearMonth ? `Bulan ${yearMonth}` : 'Bulan Tertentu'
+                    };
+                    await msg.reply(`📋 *Riwayat Transaksi ${periodLabels[period]}*\n\nBelum ada transaksi.`);
                     return;
                 }
 
-                let response = '📋 *Riwayat Transaksi (10 Terakhir)*\n\n';
+                const periodLabels = {
+                    'today': 'Hari Ini',
+                    'this_month': 'Bulan Ini',
+                    'last_month': 'Bulan Lalu',
+                    'all_time': `Semua (${txHistory.length} transaksi)`,
+                    'specific_month': yearMonth ? yearMonth : 'Bulan Tertentu'
+                };
+
+                let response = `📋 *Riwayat Transaksi ${periodLabels[period]}*\n\n`;
                 
                 txHistory.forEach((tx, index) => {
                     const icon = tx.type === 'income' ? '📈' : '📉';
@@ -299,29 +320,156 @@ client.on('message', async (msg) => {
                 addToChatHistory(userId, response, 'bot');
             }
             else if (decision.action === 'show_stats') {
-                const stats = await financeManager.getMonthlyStats(userId);
-                const categoryStats = await financeManager.getCategoryStats(userId);
+                const period = decision.params?.period || 'today';
                 const balance = await financeManager.getBalance(userId);
                 
-                let response = `📊 *Statistik Bulan Ini*\n\n` +
-                    `📈 Pemasukan: ${formatCurrency(stats.income)}\n` +
-                    `   (${stats.incomeCount} transaksi)\n\n` +
-                    `📉 Pengeluaran: ${formatCurrency(stats.expense)}\n` +
-                    `   (${stats.expenseCount} transaksi)\n\n`;
-                
-                if (categoryStats.length > 0) {
-                    response += `🏷️ *Per Kategori:*\n`;
-                    categoryStats.forEach(cat => {
-                        response += `   • ${cat.category}: ${formatCurrency(cat.total)} (${cat.count}x)\n`;
-                    });
-                    response += `\n`;
+                try {
+                    if (period === 'all_time') {
+                        // All-time stats with monthly trends chart
+                        await msg.reply('⏳ Sedang membuat chart trend bulanan...');
+                        
+                        const monthlyData = await financeManager.getMonthlyTrends(userId);
+                        const allTimeStats = await financeManager.getAllTimeStats(userId);
+                        const firstDate = await financeManager.getFirstTransactionDate(userId);
+                        
+                        if (Object.keys(monthlyData).length === 0) {
+                            await msg.reply('📊 *Belum ada data transaksi*');
+                            return;
+                        }
+                        
+                        const monthCount = Object.keys(monthlyData).length;
+                        
+                        const chartMedia = await chartGenerator.generateMonthlyTrendsChartMedia(
+                            monthlyData,
+                            allTimeStats.income,
+                            allTimeStats.expense
+                        );
+                        
+                        const caption = chartGenerator.generateTrendsCaption(
+                            monthlyData,
+                            allTimeStats.income,
+                            allTimeStats.expense,
+                            monthCount
+                        );
+                        
+                        await client.sendMessage(userId, chartMedia, { caption });
+                        addToChatHistory(userId, 'Chart trend bulanan dikirim', 'bot');
+                        
+                    } else if (period === 'today') {
+                        // Daily stats with pie chart if available
+                        const stats = await financeManager.getDailyStats(userId);
+                        const categoryStats = await financeManager.getDailyCategoryStats(userId);
+                        
+                        if (categoryStats.length > 0) {
+                            await msg.reply('⏳ Sedang membuat chart statistik...');
+                            
+                            const chartMedia = await chartGenerator.generateExpenseChartMedia(
+                                categoryStats,
+                                stats.income,
+                                stats.expense,
+                                'Hari Ini'
+                            );
+                            
+                            let caption = `📊 *Statistik Hari Ini*\n\n`;
+                            caption += `📈 Pemasukan: ${formatCurrency(stats.income)}\n`;
+                            caption += `   (${stats.incomeCount} transaksi)\n\n`;
+                            caption += `📉 Pengeluaran: ${formatCurrency(stats.expense)}\n`;
+                            caption += `   (${stats.expenseCount} transaksi)\n\n`;
+                            
+                            const totalExpenseValue = categoryStats.reduce((sum, cat) => sum + cat.total, 0);
+                            caption += `🏷️ *Pengeluaran per Kategori:*\n`;
+                            categoryStats.forEach(cat => {
+                                const percentage = ((cat.total / totalExpenseValue) * 100).toFixed(1);
+                                const icon = chartGenerator.getCategoryIcon(cat.category);
+                                caption += `${icon} ${cat.category}: ${formatCurrency(cat.total)} (${percentage}%)\n`;
+                            });
+                            caption += `\n💰 Saldo: ${formatCurrency(balance)}\n`;
+                            caption += `📊 Net Hari Ini: ${formatCurrency(stats.income - stats.expense)}`;
+                            
+                            await client.sendMessage(userId, chartMedia, { caption });
+                            addToChatHistory(userId, 'Chart statistik hari ini dikirim', 'bot');
+                        } else {
+                            let response = `📊 *Statistik Hari Ini*\n\n` +
+                                `📈 Pemasukan: ${formatCurrency(stats.income)}\n` +
+                                `   (${stats.incomeCount} transaksi)\n\n` +
+                                `📉 Pengeluaran: ${formatCurrency(stats.expense)}\n` +
+                                `   (${stats.expenseCount} transaksi)\n\n` +
+                                `💰 Saldo: ${formatCurrency(balance)}\n\n` +
+                                `📊 Net: ${formatCurrency(stats.income - stats.expense)}\n\n` +
+                                `_Belum ada pengeluaran hari ini_`;
+                            await msg.reply(response);
+                            addToChatHistory(userId, response, 'bot');
+                        }
+                        
+                    } else if (period === 'this_month' || period === 'last_month' || period === 'specific_month') {
+                        // Monthly stats with pie chart
+                        let yearMonth;
+                        let periodLabel;
+                        
+                        if (period === 'this_month') {
+                            const now = new Date();
+                            yearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                            periodLabel = 'Bulan Ini';
+                        } else if (period === 'last_month') {
+                            const now = new Date();
+                            now.setMonth(now.getMonth() - 1);
+                            yearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                            periodLabel = 'Bulan Lalu';
+                        } else {
+                            yearMonth = decision.params.month;
+                            const [year, month] = yearMonth.split('-');
+                            const monthNames = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+                            periodLabel = `${monthNames[parseInt(month) - 1]} ${year}`;
+                        }
+                        
+                        const stats = await financeManager.getMonthlyStatsByMonth(userId, yearMonth);
+                        const categoryStats = await financeManager.getCategoryStatsByMonth(userId, yearMonth);
+                        
+                        if (categoryStats.length > 0) {
+                            await msg.reply('⏳ Sedang membuat chart statistik...');
+                            
+                            const chartMedia = await chartGenerator.generateExpenseChartMedia(
+                                categoryStats,
+                                stats.income,
+                                stats.expense,
+                                periodLabel
+                            );
+                            
+                            let caption = `📊 *Statistik ${periodLabel}*\n\n`;
+                            caption += `📈 Pemasukan: ${formatCurrency(stats.income)}\n`;
+                            caption += `   (${stats.incomeCount} transaksi)\n\n`;
+                            caption += `📉 Pengeluaran: ${formatCurrency(stats.expense)}\n`;
+                            caption += `   (${stats.expenseCount} transaksi)\n\n`;
+                            
+                            const totalExpenseValue = categoryStats.reduce((sum, cat) => sum + cat.total, 0);
+                            caption += `🏷️ *Pengeluaran per Kategori:*\n`;
+                            categoryStats.forEach(cat => {
+                                const percentage = ((cat.total / totalExpenseValue) * 100).toFixed(1);
+                                const icon = chartGenerator.getCategoryIcon(cat.category);
+                                caption += `${icon} ${cat.category}: ${formatCurrency(cat.total)} (${percentage}%)\n`;
+                            });
+                            caption += `\n💰 Saldo: ${formatCurrency(balance)}\n`;
+                            caption += `📊 Net: ${formatCurrency(stats.income - stats.expense)}`;
+                            
+                            await client.sendMessage(userId, chartMedia, { caption });
+                            addToChatHistory(userId, `Chart statistik ${periodLabel} dikirim`, 'bot');
+                        } else {
+                            let response = `📊 *Statistik ${periodLabel}*\n\n` +
+                                `📈 Pemasukan: ${formatCurrency(stats.income)}\n` +
+                                `   (${stats.incomeCount} transaksi)\n\n` +
+                                `📉 Pengeluaran: ${formatCurrency(stats.expense)}\n` +
+                                `   (${stats.expenseCount} transaksi)\n\n` +
+                                `💰 Saldo: ${formatCurrency(balance)}\n\n` +
+                                `📊 Net: ${formatCurrency(stats.income - stats.expense)}\n\n` +
+                                `_Belum ada pengeluaran di periode ini_`;
+                            await msg.reply(response);
+                            addToChatHistory(userId, response, 'bot');
+                        }
+                    }
+                } catch (error) {
+                    console.error('❌ Error generating stats:', error);
+                    await msg.reply('❌ Gagal membuat statistik. Silakan coba lagi.');
                 }
-                
-                response += `💰 Saldo: ${formatCurrency(balance)}\n\n` +
-                    `📊 Net: ${formatCurrency(stats.income - stats.expense)}`;
-
-                await msg.reply(response);
-                addToChatHistory(userId, response, 'bot');
             }
             else if (decision.action === 'show_wallets') {
                 const wallets = await financeManager.getWallets(userId);
@@ -375,6 +523,12 @@ Bot akan otomatis adjust jika beda
 • "saya mau database nya"
 • "backup database"
 
+📊 *Export Excel:*
+• "export excel" - semua transaksi bulan ini
+• "export pengeluaran" - pengeluaran bulan ini
+• "export pemasukan hari ini" - pemasukan hari ini
+• "export semua transaksi" - semua transaksi
+
 _Semua perintah diproses dengan AI - cukup chat natural!_`;
                 
                 await msg.reply(helpText);
@@ -393,6 +547,79 @@ _Semua perintah diproses dengan AI - cukup chat natural!_`;
                     await msg.reply('✅ Backup database berhasil dikirim ke owner!');
                 } else {
                     await msg.reply(`❌ Gagal backup database: ${result.error}`);
+                }
+            }
+            else if (decision.action === 'export_excel') {
+                await msg.reply('⏳ Sedang membuat file Excel...');
+                
+                try {
+                    const type = decision.params.type || 'all';
+                    const period = decision.params.period || 'this_month';
+                    const month = decision.params.month;
+                    
+                    // Get wallet data
+                    const wallets = await financeManager.getWallets(userId);
+                    
+                    // Get transactions based on period
+                    let transactions = [];
+                    const now = new Date();
+                    const currentYear = now.getFullYear();
+                    const currentMonth = now.getMonth() + 1;
+                    
+                    if (period === 'today') {
+                        const today = now.toISOString().split('T')[0];
+                        const allTx = await financeManager.getHistoryByPeriod(userId, 'today');
+                        transactions = allTx;
+                    } else if (period === 'this_month') {
+                        const targetMonth = `${currentYear}-${String(currentMonth).padStart(2, '0')}`;
+                        transactions = await financeManager.getHistoryByPeriod(userId, 'this_month');
+                    } else if (period === 'last_month') {
+                        const lastMonth = currentMonth === 1 ? 12 : currentMonth - 1;
+                        const lastYear = currentMonth === 1 ? currentYear - 1 : currentYear;
+                        const targetMonth = `${lastYear}-${String(lastMonth).padStart(2, '0')}`;
+                        transactions = await financeManager.getHistoryByPeriod(userId, 'last_month');
+                    } else if (period === 'specific_month' && month) {
+                        transactions = await financeManager.getHistoryByPeriod(userId, 'specific_month', month);
+                    } else if (period === 'all_time') {
+                        transactions = await financeManager.getHistoryByPeriod(userId, 'all_time');
+                    }
+                    
+                    // Filter by type
+                    if (type === 'income') {
+                        transactions = transactions.filter(tx => tx.type === 'income');
+                    } else if (type === 'expense') {
+                        transactions = transactions.filter(tx => tx.type === 'expense');
+                    }
+                    
+                    // Check if no transactions
+                    if (transactions.length === 0) {
+                        const typeLabel = type === 'income' ? 'pemasukan' : type === 'expense' ? 'pengeluaran' : 'transaksi';
+                        const periodLabel = period === 'today' ? 'hari ini' : period === 'this_month' ? 'bulan ini' : period === 'last_month' ? 'bulan lalu' : period === 'specific_month' ? `bulan ${month}` : 'selama ini';
+                        await msg.reply(`📊 Tidak ada ${typeLabel} ${periodLabel}`);
+                        return;
+                    }
+                    
+                    // Export to Excel with wallet data
+                    const result = await excelExporter.exportTransactions(transactions, type, userId, wallets);
+                    
+                    if (result.success) {
+                        // Send Excel file to user
+                        await excelExporter.sendExcelToUser(
+                            client,
+                            userId,
+                            result.filePath,
+                            result.filename,
+                            type,
+                            result.totalIncome,
+                            result.totalExpense,
+                            result.count
+                        );
+                    } else {
+                        await msg.reply('❌ Gagal membuat file Excel');
+                    }
+                } catch (error) {
+                    console.error('❌ Export Excel error:', error);
+                    await msg.reply(`❌ Gagal export Excel: ${error.message}`);
                 }
             }
             else if (decision.action === 'other') {

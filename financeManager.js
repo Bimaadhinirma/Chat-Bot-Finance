@@ -498,6 +498,36 @@ class FinanceManager {
     }
 
     /**
+     * Get history by period
+     */
+    getHistoryByPeriod(userId, period, yearMonth = null, limit = 20) {
+        return new Promise((resolve, reject) => {
+            let query = 'SELECT * FROM transactions WHERE user_id = ?';
+            const params = [userId];
+            
+            if (period === 'today') {
+                query += ` AND date(created_at) = date('now')`;
+            } else if (period === 'this_month') {
+                query += ` AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')`;
+            } else if (period === 'last_month') {
+                query += ` AND strftime('%Y-%m', created_at) = strftime('%Y-%m', date('now', '-1 month'))`;
+            } else if (period === 'specific_month' && yearMonth) {
+                query += ` AND strftime('%Y-%m', created_at) = ?`;
+                params.push(yearMonth);
+            }
+            // 'all_time' tidak menambahkan kondisi WHERE tambahan
+            
+            query += ' ORDER BY created_at DESC LIMIT ?';
+            params.push(limit);
+            
+            db.all(query, params, (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows);
+            });
+        });
+    }
+
+    /**
      * Mendapatkan statistik bulanan
      */
     getMonthlyStats(userId) {
@@ -559,6 +589,234 @@ class FinanceManager {
             db.all(query, [userId], (err, rows) => {
                 if (err) return reject(err);
                 resolve(rows || []);
+            });
+        });
+    }
+
+    /**
+     * Statistik hari ini
+     */
+    getDailyStats(userId) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT 
+                    type,
+                    SUM(amount) as total,
+                    COUNT(*) as count
+                FROM transactions 
+                WHERE user_id = ? 
+                AND date(created_at) = date('now')
+                GROUP BY type
+            `;
+            
+            db.all(query, [userId], (err, rows) => {
+                if (err) return reject(err);
+                
+                const stats = {
+                    income: 0,
+                    expense: 0,
+                    incomeCount: 0,
+                    expenseCount: 0
+                };
+                
+                rows.forEach(row => {
+                    if (row.type === 'income') {
+                        stats.income = row.total;
+                        stats.incomeCount = row.count;
+                    } else {
+                        stats.expense = row.total;
+                        stats.expenseCount = row.count;
+                    }
+                });
+                
+                resolve(stats);
+            });
+        });
+    }
+
+    /**
+     * Statistik per kategori hari ini
+     */
+    getDailyCategoryStats(userId) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT 
+                    category,
+                    SUM(amount) as total,
+                    COUNT(*) as count
+                FROM transactions 
+                WHERE user_id = ? 
+                AND type = 'expense'
+                AND date(created_at) = date('now')
+                GROUP BY category
+                ORDER BY total DESC
+            `;
+            
+            db.all(query, [userId], (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows || []);
+            });
+        });
+    }
+
+    /**
+     * Statistik bulan tertentu (format: YYYY-MM atau nama bulan)
+     */
+    getMonthlyStatsByMonth(userId, yearMonth) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT 
+                    type,
+                    SUM(amount) as total,
+                    COUNT(*) as count
+                FROM transactions 
+                WHERE user_id = ? 
+                AND strftime('%Y-%m', created_at) = ?
+                GROUP BY type
+            `;
+            
+            db.all(query, [userId, yearMonth], (err, rows) => {
+                if (err) return reject(err);
+                
+                const stats = {
+                    income: 0,
+                    expense: 0,
+                    incomeCount: 0,
+                    expenseCount: 0,
+                    month: yearMonth
+                };
+                
+                rows.forEach(row => {
+                    if (row.type === 'income') {
+                        stats.income = row.total;
+                        stats.incomeCount = row.count;
+                    } else {
+                        stats.expense = row.total;
+                        stats.expenseCount = row.count;
+                    }
+                });
+                
+                resolve(stats);
+            });
+        });
+    }
+
+    /**
+     * Statistik per kategori bulan tertentu
+     */
+    getCategoryStatsByMonth(userId, yearMonth) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT 
+                    category,
+                    SUM(amount) as total,
+                    COUNT(*) as count
+                FROM transactions 
+                WHERE user_id = ? 
+                AND type = 'expense'
+                AND strftime('%Y-%m', created_at) = ?
+                GROUP BY category
+                ORDER BY total DESC
+            `;
+            
+            db.all(query, [userId, yearMonth], (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows || []);
+            });
+        });
+    }
+
+    /**
+     * Statistik all-time (seluruh periode)
+     */
+    getAllTimeStats(userId) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT 
+                    type,
+                    SUM(amount) as total,
+                    COUNT(*) as count
+                FROM transactions 
+                WHERE user_id = ?
+                GROUP BY type
+            `;
+            
+            db.all(query, [userId], (err, rows) => {
+                if (err) return reject(err);
+                
+                const stats = {
+                    income: 0,
+                    expense: 0,
+                    incomeCount: 0,
+                    expenseCount: 0
+                };
+                
+                rows.forEach(row => {
+                    if (row.type === 'income') {
+                        stats.income = row.total;
+                        stats.incomeCount = row.count;
+                    } else {
+                        stats.expense = row.total;
+                        stats.expenseCount = row.count;
+                    }
+                });
+                
+                resolve(stats);
+            });
+        });
+    }
+
+    /**
+     * Statistik per bulan untuk chart combo (bar/line)
+     */
+    getMonthlyTrends(userId) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT 
+                    strftime('%Y-%m', created_at) as month,
+                    type,
+                    SUM(amount) as total
+                FROM transactions 
+                WHERE user_id = ?
+                GROUP BY month, type
+                ORDER BY month ASC
+            `;
+            
+            db.all(query, [userId], (err, rows) => {
+                if (err) return reject(err);
+                
+                // Group by month
+                const monthlyData = {};
+                rows.forEach(row => {
+                    if (!monthlyData[row.month]) {
+                        monthlyData[row.month] = { income: 0, expense: 0 };
+                    }
+                    if (row.type === 'income') {
+                        monthlyData[row.month].income = row.total;
+                    } else {
+                        monthlyData[row.month].expense = row.total;
+                    }
+                });
+                
+                resolve(monthlyData);
+            });
+        });
+    }
+
+    /**
+     * Get first transaction date
+     */
+    getFirstTransactionDate(userId) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT MIN(created_at) as first_date
+                FROM transactions
+                WHERE user_id = ?
+            `;
+            
+            db.get(query, [userId], (err, row) => {
+                if (err) return reject(err);
+                resolve(row?.first_date || null);
             });
         });
     }

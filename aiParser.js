@@ -76,18 +76,38 @@ AVAILABLE ACTIONS:
    - transfer: {"type":"transfer","amount":...,"fromWallet":"...","toWallet":"...","description":"...","date":"YYYY-MM-DD"}
    - adjustment: {"type":"adjustment","wallet":"...","realBalance":...,"description":"..."}
    
-10. "show_history" - Tampilkan riwayat transaksi
+10. "show_history" - Tampilkan riwayat transaksi (DEFAULT: hari ini)
+    params: {"period": "today|this_month|last_month|all_time|specific_month", "month": "YYYY-MM" (optional), "limit": number}
+    - "transaksi" atau "riwayat" → period: "today", limit: 10 (hari ini)
+    - "transaksi bulan ini" → period: "this_month", limit: 20
+    - "transaksi bulan lalu" → period: "last_month", limit: 20
+    - "transaksi bulan januari" → period: "specific_month", month: "2025-01", limit: 20
+    - "transaksi semua" atau "semua transaksi" → period: "all_time", limit: 50
    
-11. "show_stats" - Tampilkan statistik
+11. "show_stats" - Tampilkan statistik (DEFAULT: hari ini)
+    params: {"period": "today|this_month|last_month|all_time|specific_month", "month": "YYYY-MM" (optional)}
+    - "statistik" atau "stats" → period: "today" (hari ini)
+    - "statistik bulan ini" → period: "this_month"
+    - "statistik bulan lalu" → period: "last_month"
+    - "statistik bulan januari" atau "statistik bulan 1" → period: "specific_month", month: "2025-01"
+    - "statistik selama ini" atau "statistik semua" → period: "all_time"
    
 12. "show_wallets" - Tampilkan daftar wallet
 
 13. "backup_database" - Backup dan kirim database ke owner
     params: {}
    
-14. "help" - Tampilkan bantuan
+14. "export_excel" - Export transaksi ke Excel
+    params: {"type": "income|expense|all", "period": "today|this_month|last_month|all_time|specific_month", "month": "YYYY-MM" (optional)}
+    - "export excel pengeluaran" → type: "expense", period: "this_month"
+    - "export pemasukan bulan ini" → type: "income", period: "this_month"
+    - "export semua transaksi" atau "export excel" → type: "all", period: "this_month"
+    - "export pengeluaran hari ini" → type: "expense", period: "today"
+    - "export excel januari" → type: "all", period: "specific_month", month: "2025-01"
    
-15. "other" - Tidak jelas/perlu info lebih
+15. "help" - Tampilkan bantuan
+   
+16. "other" - Tidak jelas/perlu info lebih
 
 LOGIC RULES:
 - Jika user bilang "tabungan saya 1.5jt" dan dari history/wallet data terlihat beda → ACTION: adjustment
@@ -96,6 +116,9 @@ LOGIC RULES:
 - Jika user bilang "narik 50rb" tanpa tujuan jelas → ACTION: transfer dari rekening ke cash (dari context)
 - Jika user minta "buatkan kantong X" → ACTION: create_wallet
 - Jika user minta "backup database", "saya mau database nya", "kirim database" → ACTION: backup_database
+- DEFAULT statistik adalah HARI INI, bukan bulan ini
+- "statistik bulan 6" → specific_month dengan month: "2025-06"
+- "statistik januari" atau "statistik bulan januari" → specific_month dengan month: "2025-01"
 - Parse angka: "1jt 500" = 1500000, "50rb" = 50000, "5jt" = 5000000, "2500" = 2500
 - Parse tanggal: "kemarin" = 2025-11-25, "tanggal 24" = 2025-11-24, "24 november" = 2025-11-24
 - PENTING: Untuk multiple actions gunakan multi_command dengan array commands
@@ -129,6 +152,18 @@ User: "kemarin saya terima 1jt, transfer 650rb ke tabungan dengan biaya 2500, da
   {"type":"expense","amount":2500,"wallet":"rekening","description":"biaya transfer","category":"biaya","date":"2025-11-24"},
   {"type":"adjustment","wallet":"tabungan","realBalance":1500000,"description":"Penyesuaian saldo"}
 ]}, "reasoning": "Multiple aksi: income, transfer, expense biaya, dan adjustment saldo"}
+
+User: "export excel pengeluaran bulan ini"
+→ {"action": "export_excel", "params": {"type": "expense", "period": "this_month"}, "reasoning": "User ingin export Excel untuk pengeluaran bulan ini"}
+
+User: "export semua transaksi"
+→ {"action": "export_excel", "params": {"type": "all", "period": "this_month"}, "reasoning": "User ingin export semua transaksi bulan ini ke Excel"}
+
+User: "export pemasukan hari ini"
+→ {"action": "export_excel", "params": {"type": "income", "period": "today"}, "reasoning": "User ingin export pemasukan hari ini ke Excel"}
+
+User: "export excel januari"
+→ {"action": "export_excel", "params": {"type": "all", "period": "specific_month", "month": "2025-01"}, "reasoning": "User ingin export semua transaksi bulan Januari ke Excel"}
 
 Pesan user: "${message}"
 
