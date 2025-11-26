@@ -81,10 +81,13 @@ AVAILABLE ACTIONS:
 11. "show_stats" - Tampilkan statistik
    
 12. "show_wallets" - Tampilkan daftar wallet
+
+13. "backup_database" - Backup dan kirim database ke owner
+    params: {}
    
-13. "help" - Tampilkan bantuan
+14. "help" - Tampilkan bantuan
    
-14. "other" - Tidak jelas/perlu info lebih
+15. "other" - Tidak jelas/perlu info lebih
 
 LOGIC RULES:
 - Jika user bilang "tabungan saya 1.5jt" dan dari history/wallet data terlihat beda → ACTION: adjustment
@@ -92,6 +95,7 @@ LOGIC RULES:
 - Jika user bilang "dapat gaji 5jt" → ACTION: income dengan wallet dari context atau default "rekening"
 - Jika user bilang "narik 50rb" tanpa tujuan jelas → ACTION: transfer dari rekening ke cash (dari context)
 - Jika user minta "buatkan kantong X" → ACTION: create_wallet
+- Jika user minta "backup database", "saya mau database nya", "kirim database" → ACTION: backup_database
 - Parse angka: "1jt 500" = 1500000, "50rb" = 50000, "5jt" = 5000000, "2500" = 2500
 - Parse tanggal: "kemarin" = 2025-11-25, "tanggal 24" = 2025-11-24, "24 november" = 2025-11-24
 - PENTING: Untuk multiple actions gunakan multi_command dengan array commands

@@ -2,6 +2,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const financeManager = require('./financeManager');
 const { aiDecideAction } = require('./aiParser');
+const BackupManager = require('./backupManager');
 require('dotenv').config();
 
 // Chat history storage per user (max 10 messages)
@@ -56,6 +57,13 @@ client.on('qr', (qr) => {
 client.on('ready', () => {
     console.log('✅ Bot WhatsApp Keuangan siap digunakan!');
     console.log('📊 Mulai chat dengan bot untuk mencatat keuangan Anda\n');
+    
+    // Initialize backup manager and schedule auto backup
+    const backupManager = new BackupManager(client);
+    backupManager.scheduleAutoBackup();
+    
+    // Store backup manager in client for later use
+    client.backupManager = backupManager;
 });
 
 // Authentication failure
@@ -363,9 +371,29 @@ client.on('message', async (msg) => {
 • "tabungan saya sekarang 1.5jt"
 Bot akan otomatis adjust jika beda
 
+💾 *Backup Database:*
+• "saya mau database nya"
+• "backup database"
+
 _Semua perintah diproses dengan AI - cukup chat natural!_`;
                 
                 await msg.reply(helpText);
+            }
+            else if (decision.action === 'backup_database') {
+                await msg.reply('⏳ Sedang membuat backup database...');
+                
+                if (!client.backupManager) {
+                    await msg.reply('❌ Backup manager belum siap. Silakan coba lagi.');
+                    return;
+                }
+                
+                const result = await client.backupManager.sendBackupToOwner();
+                
+                if (result.success) {
+                    await msg.reply('✅ Backup database berhasil dikirim ke owner!');
+                } else {
+                    await msg.reply(`❌ Gagal backup database: ${result.error}`);
+                }
             }
             else if (decision.action === 'other') {
                 await msg.reply('❓ Maaf, saya kurang paham. Ketik "help" untuk melihat panduan.');
