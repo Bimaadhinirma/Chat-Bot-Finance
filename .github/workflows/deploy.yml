@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Deploy to VPS via SSH
+      - name: Setup and Deploy to VPS via SSH
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -18,8 +18,39 @@ jobs:
           password: ${{ secrets.VPS_PASSWORD }}
           port: ${{ secrets.VPS_PORT }}
           script: |
-            cd /home/${{ secrets.VPS_USERNAME }}/cptlrt-bot-wa
-            git pull origin main
+            # Install Node.js if not exists
+            if ! command -v node &> /dev/null; then
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+            
+            # Install PM2 if not exists
+            if ! command -v pm2 &> /dev/null; then
+              sudo npm install -g pm2
+            fi
+            
+            # Install Git if not exists
+            if ! command -v git &> /dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y git
+            fi
+            
+            # Clone or pull repository
+            if [ -d "/home/${{ secrets.VPS_USERNAME }}/cptlrt-bot-wa" ]; then
+              cd /home/${{ secrets.VPS_USERNAME }}/cptlrt-bot-wa
+              git pull origin main
+            else
+              cd /home/${{ secrets.VPS_USERNAME }}
+              git clone https://github.com/Bimaadhinirma/Chat-Bot-Finance.git cptlrt-bot-wa
+              cd cptlrt-bot-wa
+            fi
+            
+            # Install dependencies
             npm install --production
+            
+            # Restart or start PM2 process
             pm2 restart whatsapp-bot || pm2 start index.js --name whatsapp-bot
             pm2 save
+            
+            # Setup PM2 startup (only once)
+            pm2 startup systemd -u ${{ secrets.VPS_USERNAME }} --hp /home/${{ secrets.VPS_USERNAME }} || true
