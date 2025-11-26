@@ -46,7 +46,7 @@ jobs:
             fi
             
             # Install dependencies
-            npm install --production
+            npm install
             
             # Restart or start PM2 process
             pm2 restart whatsapp-bot || pm2 start index.js --name whatsapp-bot
