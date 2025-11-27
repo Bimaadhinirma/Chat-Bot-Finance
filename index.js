@@ -340,6 +340,216 @@ async function handleBusinessMode(msg, activeSession) {
     } catch (err) {
         console.error('Freeform catalog update parse error:', err);
     }
+
+    // Quick parse: add empty bouquet price via freeform before AI
+    try {
+        const addEmptyMatch = msg.body.trim().match(/(?:tambahkan|tambah)\s+harga\s+buket\s+kosong(?:\s+ukuran\s*([A-Za-z0-9\-]+))?(?:.*?harga\s*([0-9\.,\s]*(?:k|rb|ribu|jt|juta)?))/i);
+        if (addEmptyMatch) {
+            const size = (addEmptyMatch[1] || 'standard').trim();
+            const priceRaw = addEmptyMatch[2];
+            const price = parseAmount(priceRaw || '0');
+
+            if (!price || isNaN(price) || price <= 0) {
+                await msg.reply('❌ Harga tidak valid. Contoh: "tambahkan harga buket kosong ukuran XL harga 55k"');
+                return;
+            }
+
+            try {
+                await businessManager.addEmptyBouquet(businessId, size, price);
+                await msg.reply(`✅ Harga buket kosong ukuran *${size}* ditambahkan: ${formatCurrency(price)}`);
+            } catch (err) {
+                if (err && err.message === 'EMPTY_BOUQUET_ALREADY_EXISTS') {
+                    // update existing
+                    const existing = await businessManager.getEmptyBouquetBySize(businessId, size);
+                    if (existing) {
+                        await businessManager.updateEmptyBouquet(existing.id, { price });
+                        await msg.reply(`✅ Harga buket kosong ukuran *${size}* diupdate menjadi ${formatCurrency(price)}`);
+                    } else {
+                        await msg.reply('❌ Gagal menambahkan harga buket kosong.');
+                    }
+                } else {
+                    console.error('addEmptyBouquet error:', err);
+                    await msg.reply('❌ Gagal menambahkan harga buket kosong.');
+                }
+            }
+
+            return; // handled before AI
+        }
+    } catch (err) {
+        console.error('Freeform add empty bouquet parse error:', err);
+    }
+
+    // Quick parse: list empty bouquets (user asks "harga buket kosong", "daftar buket kosong")
+    try {
+        const listEmptyMatch = msg.body.trim().match(/(?:harga|daftar|list)\s+(?:buket\s+)?kosong|harga\s+buket\s+kosong/i);
+        if (listEmptyMatch) {
+            const emptyBouquets = await businessManager.getEmptyBouquets(businessId);
+            if (!emptyBouquets || emptyBouquets.length === 0) {
+                await msg.reply('📋 Belum ada data *harga buket kosong*. Tambahkan dengan: "tambahkan harga buket kosong ukuran [SIZE] harga [PRICE]"');
+                return;
+            }
+
+            let resp = `📋 *Harga Buket Kosong - ${businessName}*\n\n`;
+            emptyBouquets.forEach((eb, i) => {
+                resp += `${i + 1}. *${eb.size}* — ${formatCurrency(eb.price)}\n`;
+            });
+
+            resp += `\nGunakan: "<jumlah> tangkai <bunga> + ukuran <SIZE>" untuk menghitung estimasi harga.`;
+            await msg.reply(resp);
+            return; // handled before AI
+        }
+    } catch (err) {
+        console.error('List empty bouquets parse error:', err);
+    }
+
+    // Quick parse: bouquet price calculation — support multiple items in one message
+    try {
+        // detect explicit size override anywhere in the message (e.g. '+ ukuran XL')
+        let sizeOverrideMatch = msg.body.match(/\+?\s*ukuran\s*([A-Za-z0-9\-]+)/i);
+        let sizeOverride = sizeOverrideMatch ? sizeOverrideMatch[1].trim() : null;
+
+        // remove the size token so it doesn't interfere with splitting items
+        let bodyForParse = msg.body.replace(/\+?\s*ukuran\s*[A-Za-z0-9\-]+/i, '').trim();
+
+        // split by commas, semicolons or newlines to find multiple items
+        const parts = bodyForParse.split(/[,;\n]+/).map(p => p.trim()).filter(Boolean);
+
+        // item regex: optional number + optional 'tangkai' + flower name
+        const itemRegex = /(?:(\d+)\s*(?:tangkai)?\s*)?(?:bunga\s+)?(.+)/i;
+        const items = [];
+        for (const p of parts) {
+            const m = p.match(itemRegex);
+            if (m) {
+                const qty = m[1] ? Number(m[1]) : null;
+                let name = (m[2] || '').replace(/(berapa|harga|\?|\.)/ig, '').trim();
+                if (qty && name) items.push({ stems: qty, flower: name });
+            }
+        }
+
+        // If nothing parsed as list, try the old single-line pattern
+        if (items.length === 0) {
+            const singleMatch = msg.body.trim().match(/(\d+)\s*tangkai\s+(?:bunga\s+)?([^\+\?\n]+?)(?:\s*\+\s*ukuran\s*([A-Za-z0-9\-]+))?\s*\??$/i);
+            if (singleMatch) {
+                const stems = Number(singleMatch[1]);
+                const flowerRaw = (singleMatch[2] || '').trim();
+                const sizeOver = singleMatch[3] ? singleMatch[3].trim() : null;
+                const flowerName = flowerRaw.replace(/(berapa|harga|\?|\.)/ig, '').trim();
+                items.push({ stems, flower: flowerName });
+                if (!sizeOverride && sizeOver) sizeOverride = sizeOver;
+            }
+        }
+
+        if (items.length > 0) {
+            // Compute totals: total stems, flower cost per item (prefer catalog then materials)
+            const catalogs = await businessManager.getCatalogs(businessId);
+            const materials = await businessManager.getMaterials(businessId);
+            const empties = await businessManager.getEmptyBouquets(businessId);
+
+            let totalStems = 0;
+            let totalFlowerCost = 0;
+            const breakdown = [];
+            const missing = [];
+
+            for (const it of items) {
+                totalStems += Number(it.stems || 0);
+                const norm = normalizeName(it.flower);
+                // try catalog matching
+                let matchedCat = catalogs.find(c => normalizeName(c.name) === norm) || catalogs.find(c => normalizeName(c.name).includes(norm));
+                if (!matchedCat) {
+                    const targetTokens = new Set(norm.split(' ').filter(Boolean));
+                    let best = null; let bestScore = 0;
+                    for (const c of catalogs) {
+                        const ctokens = normalizeName(c.name).split(' ').filter(Boolean);
+                        let score = 0;
+                        for (const t of ctokens) if (targetTokens.has(t)) score++;
+                        if (score > bestScore) { bestScore = score; best = c; }
+                    }
+                    if (bestScore > 0) matchedCat = best;
+                }
+
+                let unit = null;
+                let cost = null;
+                let source = null;
+
+                if (matchedCat && matchedCat.price) {
+                    unit = Number(matchedCat.price) || 0;
+                    cost = Math.round(unit * it.stems);
+                    source = `katalog:${matchedCat.name}`;
+                } else {
+                    const mat = findMaterialByName(materials, it.flower);
+                    if (mat) {
+                        unit = (mat.unit_price === null || mat.unit_price === undefined) ? (mat.pack_price && mat.per_pack ? Number(mat.pack_price)/Number(mat.per_pack) : 0) : Number(mat.unit_price);
+                        cost = Math.round((unit || 0) * it.stems);
+                        source = `bahan:${mat.name}`;
+                    }
+                }
+
+                if (cost === null || isNaN(cost)) {
+                    missing.push(it.flower);
+                    breakdown.push({ name: it.flower, stems: it.stems, unit: null, cost: null, source: null });
+                } else {
+                    totalFlowerCost += Number(cost);
+                    breakdown.push({ name: it.flower, stems: it.stems, unit: unit, cost: cost, source: source });
+                }
+            }
+
+            // Determine chosen size based on totalStems
+            const capacities = { 'S': 6, 'M': 12, 'L': 18, 'XL': 24 };
+            let chosenSize = null;
+            if (sizeOverride) {
+                const eb = empties.find(e => normalizeName(e.size) === normalizeName(sizeOverride) || (e.size||'').toString().toUpperCase() === sizeOverride.toUpperCase());
+                if (eb) chosenSize = { size: eb.size, price: eb.price, capacity: capacities[(eb.size||'').toUpperCase()] || null };
+            }
+
+            if (!chosenSize) {
+                const candidates = empties.map(e => ({ size: e.size, price: e.price, capacity: capacities[(e.size||'').toUpperCase()] || null })).filter(Boolean);
+                const withCaps = candidates.filter(s => s.capacity && !isNaN(s.capacity)).sort((a,b)=>a.capacity-b.capacity);
+                if (withCaps.length > 0) {
+                    chosenSize = withCaps.find(s => s.capacity >= totalStems) || withCaps[withCaps.length-1];
+                } else if (candidates.length > 0) {
+                    chosenSize = candidates.slice().sort((a,b)=>a.price-b.price)[0];
+                }
+            }
+
+            const emptyPrice = chosenSize ? Number(chosenSize.price) : null;
+            const total = (Number(totalFlowerCost) || 0) + (Number(emptyPrice) || 0);
+
+            // Build reply
+            let reply = `💐 *Perhitungan Buket (Gabungan)*\n\n`;
+            reply += `• Total tangkai: *${totalStems}*\n`;
+            reply += `\n*Rincian bunga:*\n`;
+            for (const b of breakdown) {
+                if (b.cost !== null) {
+                    reply += `• ${b.stems} × ${b.name}: ${formatCurrency(b.cost)} (${b.unit ? `${formatCurrency(b.unit)}/tangkai` : '-'} via ${b.source})\n`;
+                } else {
+                    reply += `• ${b.stems} × ${b.name}: — (harga per-tangkai tidak ditemukan)\n`;
+                }
+            }
+
+            if (chosenSize) {
+                reply += `\n💳 *Harga buket kosong (${chosenSize.size}):* ${formatCurrency(chosenSize.price)} ${chosenSize.capacity ? `(muat ~${chosenSize.capacity} tangkai)` : ''}\n`;
+            } else if (empties.length > 0) {
+                reply += `\n💳 *Harga buket kosong:*\n`;
+                empties.forEach(e => reply += `• ${e.size}: ${formatCurrency(e.price)}\n`);
+            } else {
+                reply += `\n💳 *Harga buket kosong:* — (tidak ada data)\n`;
+            }
+
+            reply += `\n💐 *Total biaya bunga:* ${totalFlowerCost ? formatCurrency(totalFlowerCost) : '—'}\n`;
+            reply += `\n🧾 *Total estimasi (bunga + buket kosong):* ${formatCurrency(total)}\n`;
+
+            if (missing.length > 0) {
+                reply += `\n⚠️ Beberapa bunga tidak dapat dihitung karena tidak ada harga per-tangkai: ${[...new Set(missing)].join(', ')}. Tambahkan bahan atau katalog dengan harga per-tangkai agar perhitungan lengkap.`;
+            }
+
+            reply += `\n\n✳️ Jika Anda ingin override ukuran, tambahkan \"+ ukuran XL\" di akhir pesan.`;
+
+            await msg.reply(reply);
+            return; // handled before AI
+        }
+    } catch (err) {
+        console.error('Bouquet price parse error (multi):', err);
+    }
     
     // Quick handling: if user asked "katalog <nama>", show that specific catalog
     try {
@@ -418,6 +628,16 @@ async function handleBusinessMode(msg, activeSession) {
             } catch (error) {
                 console.error('add_material error:', error);
                 await msg.reply('❌ Gagal menambahkan atau memperbarui bahan.');
+            }
+        }
+        else if (decision.action === 'exit' || decision.action === 'keluar') {
+            try {
+                await businessManager.endBusinessSession(userId);
+                await msg.reply('✅ Keluar dari mode bisnis.');
+                addToChatHistory(userId, 'Keluar dari mode bisnis.', 'bot');
+            } catch (err) {
+                console.error('exit business action error:', err);
+                await msg.reply('❌ Gagal keluar dari mode bisnis.');
             }
         }
         else if (decision.action === 'list_materials') {
@@ -555,6 +775,97 @@ async function handleBusinessMode(msg, activeSession) {
             await msg.reply(response);
             addToChatHistory(userId, response, 'bot');
         }
+        else if (decision.action === 'calculate_bouquet') {
+            const stems = Number(decision.params?.stems) || 0;
+            const flower = (decision.params?.flower || '').toString();
+            const size = decision.params?.size || null;
+
+            try {
+                let flowerCost = 0;
+                let usedCatalog = false;
+                if (stems > 0 && flower) {
+                    // Prefer catalog price if available
+                    try {
+                        const catalogs = await businessManager.getCatalogs(businessId);
+                        const normFlower = normalizeName(flower);
+                        let matchedCat = catalogs.find(c => normalizeName(c.name) === normFlower) || catalogs.find(c => normalizeName(c.name).includes(normFlower));
+                        if (!matchedCat) {
+                            const targetTokens = new Set(normFlower.split(' ').filter(Boolean));
+                            let best = null; let bestScore = 0;
+                            for (const c of catalogs) {
+                                const ctokens = normalizeName(c.name).split(' ').filter(Boolean);
+                                let score = 0;
+                                for (const t of ctokens) if (targetTokens.has(t)) score++;
+                                if (score > bestScore) { bestScore = score; best = c; }
+                            }
+                            if (bestScore > 0) matchedCat = best;
+                        }
+
+                        if (matchedCat && matchedCat.price) {
+                            const unit = Number(matchedCat.price) || 0;
+                            flowerCost = unit * stems;
+                            usedCatalog = true;
+                        }
+                    } catch (err) {
+                        console.error('catalog lookup error in calculate_bouquet:', err);
+                    }
+
+                    if (!usedCatalog) {
+                        const materials = await businessManager.getMaterials(businessId);
+                        const mat = findMaterialByName(materials, flower);
+                        if (mat) {
+                            const unit = (mat.unit_price === null || mat.unit_price === undefined) ? (mat.pack_price && mat.per_pack ? Number(mat.pack_price) / Number(mat.per_pack) : 0) : Number(mat.unit_price);
+                            flowerCost = unit * stems;
+                        }
+                    }
+                }
+
+                let chosenSize = size;
+                let emptyPrice = null;
+
+                if (chosenSize) {
+                    const eb = await businessManager.getEmptyBouquetBySize(businessId, chosenSize);
+                    if (eb) emptyPrice = eb.price;
+                } else {
+                    const empties = await businessManager.getEmptyBouquets(businessId);
+                    const capacities = { 'S': 6, 'M': 12, 'L': 18, 'XL': 24 };
+                    let candidate = null;
+                    for (const e of empties) {
+                        const cap = capacities[(e.size || '').toString().toUpperCase()] || null;
+                        if (cap && cap >= stems) {
+                            if (!candidate || (capacities[(e.size||'').toUpperCase()] < capacities[(candidate.size||'').toUpperCase()])) candidate = e;
+                        }
+                    }
+                    if (!candidate && empties.length > 0) {
+                        candidate = empties.reduce((a, b) => {
+                            const ca = capacities[(a.size||'').toUpperCase()] || 0;
+                            const cb = capacities[(b.size||'').toUpperCase()] || 0;
+                            return cb > ca ? b : a;
+                        });
+                    }
+                    if (candidate) {
+                        chosenSize = candidate.size;
+                        emptyPrice = candidate.price;
+                    }
+                }
+
+                const total = (Number(flowerCost) || 0) + (Number(emptyPrice) || 0);
+                let text = `✅ Estimasi untuk ${stems} tangkai${flower ? ' ' + flower : ''}:\n`;
+                if (usedCatalog) {
+                    text += `• Bunga: ${flowerCost ? formatCurrency(flowerCost) : '—'} (dihitung dari harga katalog)\n`;
+                } else {
+                    text += `• Bunga: ${flowerCost ? formatCurrency(flowerCost) : '— (bahan tidak ditemukan)'}\n`;
+                }
+                text += `• Buket kosong (${chosenSize || '—'}): ${emptyPrice ? formatCurrency(emptyPrice) : '— (tidak ada data)'}\n`;
+                text += `• Total estimasi: ${formatCurrency(total)}`;
+
+                await msg.reply(text);
+                addToChatHistory(userId, text, 'bot');
+            } catch (err) {
+                console.error('calculate_bouquet decision handler error:', err);
+                await msg.reply('❌ Gagal menghitung estimasi buket.');
+            }
+        }
         else if (decision.action === 'add_catalog') {
             // AI requested to add or update a catalog. Support both: update existing or create new.
             const { name, price, materials: aiMaterials, productionCost } = decision.params || {};
@@ -634,6 +945,31 @@ async function handleBusinessMode(msg, activeSession) {
             } catch (err) {
                 console.error('add_catalog error (business):', err);
                 await msg.reply('❌ Gagal menambahkan atau memperbarui katalog.');
+            }
+        }
+        else if (decision.action === 'add_empty_bouquet') {
+            const { size, price } = decision.params || {};
+            if (!size || !price) {
+                await msg.reply('❌ Untuk menambahkan harga buket kosong, sertakan `size` dan `price`. Contoh: "tambahkan harga buket kosong ukuran XL harga 55k"');
+                return;
+            }
+
+            try {
+                await businessManager.addEmptyBouquet(businessId, size, price);
+                await msg.reply(`✅ Harga buket kosong ukuran *${size}* ditambahkan: ${formatCurrency(price)}`);
+            } catch (err) {
+                if (err && err.message === 'EMPTY_BOUQUET_ALREADY_EXISTS') {
+                    const existing = await businessManager.getEmptyBouquetBySize(businessId, size);
+                    if (existing) {
+                        await businessManager.updateEmptyBouquet(existing.id, { price });
+                        await msg.reply(`✅ Harga buket kosong ukuran *${size}* diupdate menjadi ${formatCurrency(price)}`);
+                    } else {
+                        await msg.reply('❌ Gagal menambahkan harga buket kosong.');
+                    }
+                } else {
+                    console.error('add_empty_bouquet decision handler error:', err);
+                    await msg.reply('❌ Gagal menambahkan harga buket kosong.');
+                }
             }
         }
         else if (decision.action === 'show_catalogs') {
@@ -998,6 +1334,139 @@ async function handleBusinessMode(msg, activeSession) {
                     } else if (cmd.type === 'add_income') {
                         await businessManager.addIncome(businessId, cmd.description || 'pemasukan', cmd.amount || 0);
                         results.push(`✅ Pemasukan dicatat: ${formatCurrency(cmd.amount || 0)}`);
+                    } else if (cmd.type === 'add_empty_bouquet') {
+                        const size = (cmd.size || cmd.ukuran || '').toString().trim();
+                        const priceVal = cmd.price !== undefined ? Number(cmd.price) : (cmd.harga !== undefined ? Number(cmd.harga) : null);
+
+                        if (!size) {
+                            results.push('❌ Perintah add_empty_bouquet butuh parameter size (mis. "size":"XL").');
+                        } else if (!priceVal || isNaN(priceVal)) {
+                            results.push('❌ Perintah add_empty_bouquet butuh parameter price yang valid (mis. 55000).');
+                        } else {
+                            try {
+                                const existing = await businessManager.getEmptyBouquetBySize(businessId, size);
+                                if (existing) {
+                                    await businessManager.updateEmptyBouquet(existing.id, { price: priceVal });
+                                    results.push(`✅ Harga buket kosong ukuran *${existing.size}* diperbarui menjadi ${formatCurrency(priceVal)}`);
+                                } else {
+                                    await businessManager.addEmptyBouquet(businessId, size, priceVal);
+                                    results.push(`✅ Harga buket kosong ukuran *${size}* ditambahkan: ${formatCurrency(priceVal)}`);
+                                }
+                            } catch (err) {
+                                console.error('multi add_empty_bouquet error:', err);
+                                results.push(`❌ Gagal menambahkan/ memperbarui buket kosong: ${err.message || err}`);
+                            }
+                        }
+                    } else if (cmd.type === 'calculate_bouquet') {
+                        // Calculate bouquet estimate: stems, flower (optional), size (optional)
+                        const stems = Number(cmd.stems) || Number(cmd.tangkai) || 0;
+                        const flower = (cmd.flower || cmd.name || '').toString();
+                        const size = cmd.size || cmd.ukuran || null;
+
+                        try {
+                            let flowerCost = 0;
+                            let usedCatalog = false;
+                            if (stems > 0 && flower) {
+                                // Prefer catalog price if a matching catalog exists
+                                try {
+                                    const catalogs = await businessManager.getCatalogs(businessId);
+                                    const normFlower = normalizeName(flower);
+                                    let matchedCat = catalogs.find(c => normalizeName(c.name) === normFlower) || catalogs.find(c => normalizeName(c.name).includes(normFlower));
+                                    if (!matchedCat) {
+                                        // token overlap scoring
+                                        const targetTokens = new Set(normFlower.split(' ').filter(Boolean));
+                                        let best = null; let bestScore = 0;
+                                        for (const c of catalogs) {
+                                            const ctokens = normalizeName(c.name).split(' ').filter(Boolean);
+                                            let score = 0;
+                                            for (const t of ctokens) if (targetTokens.has(t)) score++;
+                                            if (score > bestScore) { bestScore = score; best = c; }
+                                        }
+                                        if (bestScore > 0) matchedCat = best;
+                                    }
+
+                                    if (matchedCat && matchedCat.price) {
+                                        const unit = Number(matchedCat.price) || 0;
+                                        flowerCost = unit * stems;
+                                        usedCatalog = true;
+                                    }
+                                } catch (err) {
+                                    // ignore catalog lookup errors and fallback to materials
+                                    console.error('catalog lookup error in multi calculate_bouquet:', err);
+                                }
+
+                                // Fallback to materials if catalog not used
+                                if (!usedCatalog) {
+                                    const materials = await businessManager.getMaterials(businessId);
+                                    const mat = findMaterialByName(materials, flower);
+                                    if (mat) {
+                                        const unit = (mat.unit_price === null || mat.unit_price === undefined) ? (mat.pack_price && mat.per_pack ? Number(mat.pack_price) / Number(mat.per_pack) : 0) : Number(mat.unit_price);
+                                        flowerCost = unit * stems;
+                                    }
+                                }
+                            }
+
+                            let chosenSize = size;
+                            let emptyPrice = null;
+
+                            if (chosenSize) {
+                                const eb = await businessManager.getEmptyBouquetBySize(businessId, chosenSize);
+                                if (eb) emptyPrice = eb.price;
+                            } else {
+                                const empties = await businessManager.getEmptyBouquets(businessId);
+                                const capacities = { 'S': 6, 'M': 12, 'L': 18, 'XL': 24 };
+                                // pick the smallest size that fits stems
+                                let candidate = null;
+                                for (const e of empties) {
+                                    const cap = capacities[(e.size || '').toString().toUpperCase()] || null;
+                                    if (cap && cap >= stems) {
+                                        if (!candidate || (capacities[(e.size||'').toUpperCase()] < capacities[(candidate.size||'').toUpperCase()])) candidate = e;
+                                    }
+                                }
+                                if (!candidate && empties.length > 0) {
+                                    // fallback to largest available
+                                    candidate = empties.reduce((a, b) => {
+                                        const ca = capacities[(a.size||'').toUpperCase()] || 0;
+                                        const cb = capacities[(b.size||'').toUpperCase()] || 0;
+                                        return cb > ca ? b : a;
+                                    });
+                                }
+                                if (candidate) {
+                                    chosenSize = candidate.size;
+                                    emptyPrice = candidate.price;
+                                }
+                            }
+
+                            const total = (Number(flowerCost) || 0) + (Number(emptyPrice) || 0);
+                            let text = `✅ Estimasi untuk ${stems} tangkai${flower ? ' ' + flower : ''}:\n`;
+                            if (usedCatalog) {
+                                text += `• Bunga: ${flowerCost ? formatCurrency(flowerCost) : '—'} (dihitung dari harga katalog)\n`;
+                            } else {
+                                text += `• Bunga: ${flowerCost ? formatCurrency(flowerCost) : '— (bahan tidak ditemukan)'}\n`;
+                            }
+                            text += `• Buket kosong (${chosenSize || '—'}): ${emptyPrice ? formatCurrency(emptyPrice) : '— (tidak ada data)'}\n`;
+                            text += `• Total estimasi: ${formatCurrency(total)}`;
+                            results.push(text);
+                        } catch (err) {
+                            console.error('multi calculate_bouquet error:', err);
+                            results.push(`❌ Gagal menghitung buket: ${err.message || err}`);
+                        }
+                    } else if (cmd.type === 'list_empty_bouquets') {
+                        try {
+                            const empties = await businessManager.getEmptyBouquets(businessId);
+                            if (!empties || empties.length === 0) {
+                                results.push('ℹ️ Belum ada data harga buket kosong.');
+                            } else {
+                                let lines = '📋 Daftar Buket Kosong:\n';
+                                empties.forEach(e => {
+                                    lines += `• ${e.size}: ${formatCurrency(e.price)}\n`;
+                                });
+                                results.push(lines);
+                            }
+                        } catch (err) {
+                            console.error('multi list_empty_bouquets error:', err);
+                            results.push(`❌ Gagal mengambil daftar buket kosong: ${err.message || err}`);
+                        }
                     } else {
                         results.push(`❌ Perintah tidak dikenali: ${cmd.type}`);
                     }
@@ -2155,6 +2624,10 @@ client.on('message', async (msg) => {
                         else if (cmd.type === 'income') {
                             await financeManager.addIncome(userId, cmd.amount, cmd.description, cmd.wallet || 'cash', cmd.category, cmd.date);
                             results.push(`✅ Pemasukan ${formatCurrency(cmd.amount)}`);
+                        }
+                        else if (cmd.type === 'calculate_bouquet' || cmd.type === 'list_empty_bouquets' || cmd.type === 'add_empty_bouquet') {
+                            // Business-only commands: inform user to enter business mode
+                            results.push('❌ Perintah terkait bisnis. Masuk ke mode bisnis terlebih dahulu (ketik "mode bisnis").');
                         }
                         else if (cmd.type === 'expense') {
                             await financeManager.addExpense(userId, cmd.amount, cmd.description, cmd.wallet || 'cash', cmd.category || 'lainnya', cmd.date);

@@ -177,6 +177,19 @@ db.serialize(() => {
         )
     `);
 
+    // Tabel untuk menyimpan harga buket kosong (ukuran + harga)
+    db.run(`
+        CREATE TABLE IF NOT EXISTS empty_bouquets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_id INTEGER NOT NULL,
+            size TEXT NOT NULL,
+            price REAL NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (business_id) REFERENCES businesses(id) ON DELETE CASCADE,
+            UNIQUE(business_id, size)
+        )
+    `);
+
     // Tabel untuk session mode bisnis
     db.run(`
         CREATE TABLE IF NOT EXISTS business_sessions (

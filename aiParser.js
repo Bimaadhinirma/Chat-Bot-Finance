@@ -359,6 +359,9 @@ JENIS PERINTAH:
 3. income: {"type":"income","amount":...,"wallet":"...","description":"...","date":"YYYY-MM-DD"}
 4. expense: {"type":"expense","amount":...,"wallet":"...","category":"...","description":"...","date":"YYYY-MM-DD"}
 5. adjustment: {"type":"adjustment","wallet":"...","currentBalance":...,"realBalance":...,"description":"Penyesuaian saldo"}
+6. calculate_bouquet: {"type":"calculate_bouquet","stems":<number>,"flower":"nama bunga (opsional)","size":"S|M|L|XL (opsional)"}
+7. list_empty_bouquets: {"type":"list_empty_bouquets"}
+8. add_empty_bouquet: {"type":"add_empty_bouquet","size":"S|M|L|XL|...","price":angka}
 
 ATURAN PARSING:
 - Jika ada koma/dan dalam daftar kantong → buat beberapa perintah buat_kantong
@@ -1012,6 +1015,19 @@ AVAILABLE ACTIONS:
     params: {}
     Contoh output: "1 pack kawat bulu 14k\n1 unit kawat bulu 500 perak\n..."
 
+24. "add_empty_bouquet" - Tambah atau update harga buket kosong per ukuran
+    params: {"size": "S|M|L|XL|...", "price": angka}
+    Contoh: "tambahkan harga buket kosong ukuran XL harga 55k" atau "harga buket kosong M 45k"
+
+25. "calculate_bouquet" - Hitung estimasi harga buket berdasarkan jumlah tangkai + rekomendasi ukuran
+    params: {"stems": angka, "flower": "nama bunga (opsional)", "size": "ukuran opsional seperti S|M|L|XL"}
+    Contoh: "12 tangkai bunga mawar berapa?" → params: {"stems":12,"flower":"bunga mawar"}
+    Contoh dengan override ukuran: "12 tangkai bunga mawar + ukuran XL berapa?" → params: {"stems":12,"flower":"bunga mawar","size":"XL"}
+ 
+26. "list_empty_bouquets" - Tampilkan daftar harga buket kosong yang tersimpan
+    params: {}
+    Contoh: "harga buket kosong" → AI dapat merespons dengan action list_empty_bouquets untuk meminta bot mengirim daftar ukuran+harga
+
 LOGIC RULES:
 - Parse angka: "1jt" = 1000000, "50rb" = 50000, "14k" = 14000, "500" = 500
 - "tambahkan bahan X 1 nya Y" → add_material dengan unitPrice
@@ -1030,6 +1046,8 @@ LOGIC RULES:
 - "statistik" atau "laporan" → show_stats
 - "help" atau "bantuan" → help
 - "keluar" atau "exit" → exit
+ - "[N] tangkai [nama bunga]" atau "[N] tangkai [nama bunga] + ukuran [SIZE]" → calculate_bouquet
+     * Ekstrak jumlah tangkai (stems), nama bunga (flower, opsional) dan ukuran jika disediakan (size). AI harus mengembalikan action "calculate_bouquet" dengan params (stems, flower, size).
 
 CONTOH DECISIONS:
 User: "tambahkan bahan kawat bulu 1 nya 500 perak"
@@ -1069,6 +1087,15 @@ User: "tampilkan katalog harga jual 12k"
 → {"action": "multi_command", "params": {"commands": [
     {"type":"list_catalogs_by_price","price":12000}
 ]}, "reasoning": "User ingin melihat katalog dengan harga jual 12k"}
+
+User: "tambahkan harga buket kosong ukuran XL harga 55k"
+→ {"action": "add_empty_bouquet", "params": {"size": "XL", "price": 55000}, "reasoning": "User memberikan harga buket kosong untuk ukuran XL"}
+
+User: "12 tangkai bunga mawar berapa?"
+→ {"action": "calculate_bouquet", "params": {"stems": 12, "flower": "bunga mawar"}, "reasoning": "User ingin tahu estimasi harga untuk 12 tangkai bunga mawar"}
+
+User: "12 tangkai bunga mawar + ukuran XL berapa?"
+→ {"action": "calculate_bouquet", "params": {"stems": 12, "flower": "bunga mawar", "size": "XL"}, "reasoning": "User ingin estimasi harga untuk 12 tangkai bunga mawar menggunakan ukuran XL"}
 
 Pesan user: "${message}"
 

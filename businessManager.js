@@ -345,6 +345,95 @@ class BusinessManager {
     }
 
     /**
+     * Add empty bouquet price (size + price)
+     */
+    addEmptyBouquet(businessId, size, price) {
+        return new Promise((resolve, reject) => {
+            db.get(
+                'SELECT * FROM empty_bouquets WHERE business_id = ? AND LOWER(size) = LOWER(?)',
+                [businessId, size],
+                (err, row) => {
+                    if (err) return reject(err);
+                    if (row) return reject(new Error('EMPTY_BOUQUET_ALREADY_EXISTS'));
+                    db.run(
+                        'INSERT INTO empty_bouquets (business_id, size, price) VALUES (?, ?, ?)',
+                        [businessId, size, price],
+                        function(err) {
+                            if (err) return reject(err);
+                            resolve({ id: this.lastID, business_id: businessId, size, price });
+                        }
+                    );
+                }
+            );
+        });
+    }
+
+    /**
+     * Get all empty bouquets for a business
+     */
+    getEmptyBouquets(businessId) {
+        return new Promise((resolve, reject) => {
+            db.all(
+                'SELECT * FROM empty_bouquets WHERE business_id = ? ORDER BY created_at DESC',
+                [businessId],
+                (err, rows) => {
+                    if (err) return reject(err);
+                    resolve(rows || []);
+                }
+            );
+        });
+    }
+
+    /**
+     * Get empty bouquet by size
+     */
+    getEmptyBouquetBySize(businessId, size) {
+        return new Promise((resolve, reject) => {
+            db.get(
+                'SELECT * FROM empty_bouquets WHERE business_id = ? AND LOWER(size) = LOWER(?)',
+                [businessId, size],
+                (err, row) => {
+                    if (err) return reject(err);
+                    resolve(row || null);
+                }
+            );
+        });
+    }
+
+    /**
+     * Update empty bouquet price
+     */
+    updateEmptyBouquet(id, updates) {
+        return new Promise((resolve, reject) => {
+            const fields = [];
+            const values = [];
+            if (updates.size !== undefined) { fields.push('size = ?'); values.push(updates.size); }
+            if (updates.price !== undefined) { fields.push('price = ?'); values.push(updates.price); }
+
+            if (fields.length === 0) return resolve(false);
+
+            values.push(id);
+            const sql = `UPDATE empty_bouquets SET ${fields.join(', ')} WHERE id = ?`;
+            db.run(sql, values, function(err) {
+                if (err) return reject(err);
+                resolve(this.changes > 0);
+            });
+        });
+    }
+
+    /**
+     * Delete empty bouquet
+     */
+    deleteEmptyBouquet(id) {
+        return new Promise((resolve, reject) => {
+            db.run('DELETE FROM empty_bouquets WHERE id = ?', [id], function(err) {
+                if (err) return reject(err);
+                resolve(this.changes > 0);
+            });
+        });
+    }
+
+    /**
      * Delete price tier
      */
     deletePriceTier(priceTierId) {
