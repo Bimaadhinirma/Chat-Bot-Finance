@@ -3,7 +3,7 @@ require('dotenv').config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const businessManager = require('./businessManager');
+// business features removed: no businessManager import
 
 /**
  * AI Decision Maker - AI memutuskan action berdasarkan pesan dan context
@@ -248,29 +248,8 @@ async function explainFeature(topic = null, options = {}) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-        // Collect business methods available
-        let businessFuncs = [];
-        try {
-            businessFuncs = Object.keys(businessManager).filter(k => typeof businessManager[k] === 'function');
-        } catch (e) {
-            businessFuncs = [];
-        }
-
-        const mode = options.mode || 'general';
-        const businessName = options.businessName || '';
-
-        let prompt = `Anda adalah asisten yang menjelaskan cara menggunakan fitur sebuah bot WhatsApp. Berikan penjelasan singkat, langkah demi langkah, dan contoh percakapan (pesan user dan contoh jawaban bot) untuk topik berikut.`;
-        prompt += `\nMODE: ${mode}${businessName ? ' (Business: ' + businessName + ')' : ''}`;
-        prompt += `\nTOPIK: ${topic || 'general'}`;
-
-        prompt += `\n\nDAFTAR FITUR PERSONAL: check_balance, check_wallet_balance, adjustment, income, expense, transfer, create_wallet, update_wallet, show_history, show_stats, show_wallets, backup_database, export_excel, help`;
-        if (businessFuncs.length > 0) {
-            prompt += `\nDAFTAR FITUR BISNIS: ${businessFuncs.join(', ')}`;
-        }
-
-        prompt += `\n\nInstruksi:\n- Jika topik spesifik, jelaskan langkah-langkah yang diperlukan (input yang harus user kirim, data yang akan diminta, contoh pesan).\n- Sertakan 2-3 contoh pesan user dan contoh jawaban bot untuk tiap langkah.\n- Gunakan bahasa Indonesia yang singkat dan jelas.\n- Jika topik adalah 'general' atau null, berikan ringkasan cara cepat menggunakan bot untuk personal dan bisnis, serta 5 contoh pesan yang sering dipakai.`;
-
-        prompt += `\n\nJawab dalam teks biasa (tidak JSON).`;
+        const mode = options.mode || 'personal';
+        const prompt = `Anda adalah asisten yang menjelaskan cara menggunakan fitur bot WhatsApp versi PERSONAL. Berikan penjelasan singkat, langkah demi langkah, dan contoh percakapan (pesan user dan contoh jawaban bot) untuk topik berikut.\nMODE: ${mode}\nTOPIK: ${topic || 'general'}\n\nDAFTAR FITUR PERSONAL: check_balance, check_wallet_balance, adjustment, income, expense, transfer, create_wallet, update_wallet, show_history, show_stats, show_wallets, backup_database, export_excel, help\n\nInstruksi:\n- Jika topik spesifik, jelaskan langkah-langkah yang diperlukan (input yang harus user kirim, data yang akan diminta, contoh pesan).\n- Sertakan 2 contoh pesan user dan jawaban bot untuk tiap langkah.\n- Gunakan bahasa Indonesia yang singkat dan jelas.\n\nJawab dalam teks biasa (tidak JSON).`;
 
         const result = await model.generateContent(prompt);
         const response = result.response.text().trim();
@@ -897,238 +876,13 @@ function fallbackParser(text) {
  * AI Decision Maker untuk Business Mode
  * Return: {"action": "...", "params": {...}, "reasoning": "..."}
  */
+// Business AI decision feature removed. Keep a small stub for compatibility.
 async function aiDecideBusinessAction(message, chatHistory = [], businessContext = {}) {
-    if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === 'your_gemini_api_key_here') {
-        return null;
-    }
-
-    try {
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
-        // Build context
-        let contextPrompt = '';
-        if (chatHistory.length > 0) {
-            contextPrompt = 'CHAT HISTORY (5 terakhir):\n';
-            chatHistory.slice(-5).forEach(item => {
-                contextPrompt += `${item.role === 'user' ? 'User' : 'Bot'}: ${item.message}\n`;
-            });
-            contextPrompt += '\n';
-        }
-
-        let businessInfo = `BISNIS: ${businessContext.businessName}\n`;
-        if (businessContext.materialsCount) {
-            businessInfo += `Jumlah Bahan: ${businessContext.materialsCount}\n`;
-        }
-        if (businessContext.catalogsCount) {
-            businessInfo += `Jumlah Katalog: ${businessContext.catalogsCount}\n`;
-        }
-        businessInfo += '\n';
-
-        const prompt = `${contextPrompt}${businessInfo}TANGGAL HARI INI: ${new Date().toISOString().split('T')[0]}
-
-Kamu adalah AI business assistant untuk mode bisnis. Analisis pesan user dan TENTUKAN ACTION yang tepat.
-
-AVAILABLE ACTIONS:
-1. "add_material" - Tambah bahan/material
-   params: {"name": "...", "unitPrice": angka, "packPrice": angka (optional), "perPack": angka (optional)}
-   Contoh: "tambahkan bahan kawat bulu 1 nya 500" atau "tambahkan bahan kawat bulu per pack 14rb dan 1 an 500"
-   
-2. "list_materials" - Lihat daftar bahan
-   params: {}
-   
-3. "add_price_tier" - Tambah harga jual
-   params: {"price": angka}
-   Contoh: "tambahkan harga jual 12000" atau "tambahkan harga jual 12k"
-   
-4. "list_price_tiers" - Lihat daftar harga jual
-   params: {}
-   
-5. "delete_price_tier" - Hapus harga jual
-   params: {"price": angka} atau {"number": angka}
-   Contoh: "hapus harga jual 12000" atau "hapus harga jual nomor 1"
-   
-6. "calculate_cost" - Hitung biaya produksi
-   params: {"materials": [{"name": "...", "quantity": angka}, ...]}
-   Contoh: "hitung harga mawar 12 kawat bulu dan 1 tangkai besi"
-   Parse semua material dengan quantity dari pesan
-   
-7. "show_catalogs" - Tampilkan katalog
-   params: {}
-   
-8. "add_expense" - Catat pengeluaran
-   params: {"description": "...", "amount": angka}
-   Contoh: "belanja 1 gulung kawat bulu"
-   
-9. "show_expenses" - Tampilkan pengeluaran
-   params: {}
-   
-10. "mark_expense_recorded" - Tandai pengeluaran sudah dicatat
-    params: {"number": angka}
-    Contoh: "nomor 1 sudah saya catat"
-    
-11. "add_income" - Catat pemasukan
-    params: {"description": "...", "amount": angka}
-    Contoh: "pemasukan 50rb dari penjualan bunga"
-    
-12. "show_stats" - Tampilkan statistik bisnis
-    params: {}
-    
-13. "help" - Tampilkan bantuan
-    params: {}
-    
-14. "exit" - Keluar dari mode bisnis
-    params: {}
-    
-15. "other" - Tidak jelas/perlu info lebih
-
-16. "multi_command" - Jalankan beberapa aksi dalam satu pesan
-    params: {"commands": [ {"type": "add_material|add_price_tier|add_catalog|add_expense|add_income", ...}, ... ] }
-    Contoh: "tambahkan bahan kawat bulu 1 @500 dan tambahkan harga jual 12k"
-    → {"action": "multi_command", "params": {"commands": [
-      {"type":"add_material","name":"kawat bulu","unitPrice":500},
-      {"type":"add_price_tier","price":12000}
-    ]}, "reasoning": "User meminta beberapa aksi sekaligus: tambah bahan dan harga jual"}
-
-17. "edit_material" - Edit harga unit/pack untuk material tertentu
-    params: {"name": "kawat bulu", "unitPrice": 500, "packPrice": 14000, "perPack": 1}
-    Contoh: "edit unit kawat bulu jadi 500" atau "ubah pack kawat bulu jadi 14k"
-
-18. "delete_material" - Hapus material (unit/pack) atau seluruh material
-    params: {"name": "kawat bulu"} atau {} untuk hapus semua
-    Contoh: "hapus pack kawat bulu" atau "hapus semua bahan"
-
-19. "edit_catalog" - Edit katalog (nama/harga)
-    params: {"id": 12, "name": "bunga mawar", "price": 12000}
-    Contoh: "ubah katalog bunga mawar jadi 12k"
-
-20. "delete_catalog" - Hapus katalog tertentu
-    params: {"id": 12} atau {"name": "bunga mawar"}
-    Contoh: "hapus katalog bunga mawar" atau "hapus semua katalog"
-
-21. "delete_all_catalogs" - Hapus semua katalog
-    params: {}
-
-22. "delete_all_price_tiers" - Hapus semua harga jual
-    params: {}
-
-23. "show_examples" - Tampilkan contoh format input (pack/unit/katalog)
-    params: {}
-    Contoh output: "1 pack kawat bulu 14k\n1 unit kawat bulu 500 perak\n..."
-
-24. "add_empty_bouquet" - Tambah atau update harga buket kosong per ukuran
-    params: {"size": "S|M|L|XL|...", "price": angka}
-    Contoh: "tambahkan harga buket kosong ukuran XL harga 55k" atau "harga buket kosong M 45k"
-
-25. "calculate_bouquet" - Hitung estimasi harga buket berdasarkan jumlah tangkai + rekomendasi ukuran
-    params: {"stems": angka, "flower": "nama bunga (opsional)", "size": "ukuran opsional seperti S|M|L|XL"}
-    Contoh: "12 tangkai bunga mawar berapa?" → params: {"stems":12,"flower":"bunga mawar"}
-    Contoh dengan override ukuran: "12 tangkai bunga mawar + ukuran XL berapa?" → params: {"stems":12,"flower":"bunga mawar","size":"XL"}
- 
-26. "list_empty_bouquets" - Tampilkan daftar harga buket kosong yang tersimpan
-    params: {}
-    Contoh: "harga buket kosong" → AI dapat merespons dengan action list_empty_bouquets untuk meminta bot mengirim daftar ukuran+harga
-
-LOGIC RULES:
-- Parse angka: "1jt" = 1000000, "50rb" = 50000, "14k" = 14000, "500" = 500
-- "tambahkan bahan X 1 nya Y" → add_material dengan unitPrice
-- "tambahkan bahan X per pack Y dan 1 an Z" → add_material dengan packPrice dan unitPrice
-- "daftar bahan" → list_materials
-- "tambahkan harga jual X" → add_price_tier
-- "daftar harga jual" → list_price_tiers
-- "hapus harga jual X" → delete_price_tier dengan price
-- "hapus harga jual nomor X" → delete_price_tier dengan number
-- "hitung [nama produk] X bahan1 dan Y bahan2" → calculate_cost, ekstrak semua material
-- "katalog" atau "tampilkan katalog" → show_catalogs
-- "belanja X" atau "pengeluaran X" → add_expense
-- "tampilkan pengeluaran" → show_expenses
-- "nomor X sudah saya catat" → mark_expense_recorded
-- "pemasukan X" → add_income
-- "statistik" atau "laporan" → show_stats
-- "help" atau "bantuan" → help
-- "keluar" atau "exit" → exit
- - "[N] tangkai [nama bunga]" atau "[N] tangkai [nama bunga] + ukuran [SIZE]" → calculate_bouquet
-     * Ekstrak jumlah tangkai (stems), nama bunga (flower, opsional) dan ukuran jika disediakan (size). AI harus mengembalikan action "calculate_bouquet" dengan params (stems, flower, size).
-
-CONTOH DECISIONS:
-User: "tambahkan bahan kawat bulu 1 nya 500 perak"
-→ {"action": "add_material", "params": {"name": "kawat bulu", "unitPrice": 500}, "reasoning": "User ingin tambah bahan kawat bulu dengan harga 500 per unit"}
-
-User: "tambahkan bahan kawat bulu per pack 14rb dan 1 an 500 perak"
-→ {"action": "add_material", "params": {"name": "kawat bulu", "unitPrice": 500, "packPrice": 14000}, "reasoning": "User ingin tambah bahan kawat bulu dengan harga pack dan unit"}
-
-User: "tambahkan harga jual 12k"
-→ {"action": "add_price_tier", "params": {"price": 12000}, "reasoning": "User ingin tambah harga jual 12000"}
-
-User: "hitung harga mawar 12 kawat bulu dan 1 tangkai besi"
-→ {"action": "calculate_cost", "params": {"materials": [{"name": "kawat bulu", "quantity": 12}, {"name": "tangkai besi", "quantity": 1}]}, "reasoning": "User ingin hitung biaya produksi mawar"}
-
-User: "belanja 1 gulung kawat bulu"
-→ {"action": "add_expense", "params": {"description": "belanja 1 gulung kawat bulu", "amount": 0}, "reasoning": "User ingin catat pengeluaran, amount akan dihitung dari material jika ada"}
-
-User: "nomor 2 sudah saya catat"
-→ {"action": "mark_expense_recorded", "params": {"number": 2}, "reasoning": "User sudah mencatat pengeluaran nomor 2"}
-
-User: "pemasukan 50rb dari penjualan bunga mawar"
-→ {"action": "add_income", "params": {"description": "penjualan bunga mawar", "amount": 50000}, "reasoning": "User catat pemasukan dari penjualan"}
-
-User: "tambahkan bahan kawat bulu 1 unit 500 dan tambahkan harga jual 12k"
-→ {"action": "multi_command", "params": {"commands": [
-    {"type":"add_material","name":"kawat bulu","unitPrice":500},
-    {"type":"add_price_tier","price":12000}
-]}, "reasoning": "User meminta beberapa aksi sekaligus: tambah bahan dan tambah harga jual"}
-
-User: "tambah katalog bunga mawar 12k dan katalog bunga matahari 15k"
-→ {"action": "multi_command", "params": {"commands": [
-    {"type":"add_catalog","name":"bunga mawar","price":12000},
-    {"type":"add_catalog","name":"bunga matahari","price":15000}
-]}, "reasoning": "User ingin menambahkan beberapa katalog sekaligus"}
-
-User: "tampilkan katalog harga jual 12k"
-→ {"action": "multi_command", "params": {"commands": [
-    {"type":"list_catalogs_by_price","price":12000}
-]}, "reasoning": "User ingin melihat katalog dengan harga jual 12k"}
-
-User: "tambahkan harga buket kosong ukuran XL harga 55k"
-→ {"action": "add_empty_bouquet", "params": {"size": "XL", "price": 55000}, "reasoning": "User memberikan harga buket kosong untuk ukuran XL"}
-
-User: "12 tangkai bunga mawar berapa?"
-→ {"action": "calculate_bouquet", "params": {"stems": 12, "flower": "bunga mawar"}, "reasoning": "User ingin tahu estimasi harga untuk 12 tangkai bunga mawar"}
-
-User: "12 tangkai bunga mawar + ukuran XL berapa?"
-→ {"action": "calculate_bouquet", "params": {"stems": 12, "flower": "bunga mawar", "size": "XL"}, "reasoning": "User ingin estimasi harga untuk 12 tangkai bunga mawar menggunakan ukuran XL"}
-
-Pesan user: "${message}"
-
-Berikan response dalam format JSON:
-{
-  "action": "nama_action",
-  "params": {...},
-  "reasoning": "penjelasan singkat kenapa pilih action ini"
-}`;
-
-        const result = await model.generateContent(prompt);
-        const response = result.response.text().trim();
-        
-        // Extract JSON from response
-        const jsonMatch = response.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-            console.error('❌ AI response tidak valid JSON:', response);
-            return null;
-        }
-        
-        const decision = JSON.parse(jsonMatch[0]);
-        console.log('🤖 Business AI Decision:', decision);
-        
-        return decision;
-    } catch (error) {
-        console.error('❌ Business AI decision error:', error.message);
-        return null;
-    }
+    return null;
 }
 
 module.exports = { 
     aiDecideAction,
-    aiDecideBusinessAction,
     parseDate,
     parseMultiCommand,
     detectIntent,
