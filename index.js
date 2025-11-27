@@ -1,10 +1,13 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const financeManager = require('./financeManager');
-const { aiDecideAction } = require('./aiParser');
+const businessManager = require('./businessManager');
+const { aiDecideAction, aiDecideBusinessAction, explainFeature } = require('./aiParser');
 const BackupManager = require('./backupManager');
 const chartGenerator = require('./chartGenerator');
 const excelExporter = require('./excelExporter');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 // Chat history storage per user (max 10 messages)
@@ -99,6 +102,1370 @@ function formatDate(dateString) {
     });
 }
 
+// Business Mode Handlers
+async function handleCreateBusiness(msg, params = null) {
+    const userId = msg.from;
+    const text = msg.body.trim();
+    
+    let businessName, description;
+    
+    // If params provided by AI, use them directly
+    if (params && params.name) {
+        businessName = params.name;
+        description = params.description || '';
+    } else {
+        // Parse business creation request from text
+        // Format: "saya ada bisnis bernama Huiz bisnis ini untuk sekarang jalan di bidang Pembuatan Buket Bunga Custom"
+        const match = text.match(/bisnis\s+(?:bernama|nama)\s+([^\s]+)(?:\s+.*?bidang\s+(.+))?/i);
+        
+        if (!match) {
+            await msg.reply('❌ Format tidak valid. Contoh:\n"saya ada bisnis bernama Huiz bisnis ini untuk sekarang jalan di bidang Pembuatan Buket Bunga Custom"');
+            return;
+        }
+        
+        businessName = match[1];
+        description = match[2] || '';
+    }
+    
+    // Ask for username and password
+    await msg.reply(`🏢 *Buat Bisnis: ${businessName}*\n\nSilakan kirim username dan password dengan format:\nusername: [username]\npassword: [password]`);
+    
+    // Store in temporary state (you'll need to handle this in the next message)
+    if (!client.businessCreationState) {
+        client.businessCreationState = new Map();
+    }
+    client.businessCreationState.set(userId, { 
+        stage: 'waiting_credentials',
+        businessName: businessName,
+        description: description
+    });
+}
+
+async function handleEnterBusinessMode(msg) {
+    const userId = msg.from;
+    
+    // Get user's businesses
+    const businesses = await businessManager.getBusinessesByUser(userId);
+    
+    if (businesses.length === 0) {
+        await msg.reply('❌ Anda belum memiliki bisnis. Buat bisnis dulu dengan:\n"saya ada bisnis bernama [nama] bisnis ini untuk sekarang jalan di bidang [bidang]"');
+        return;
+    }
+    
+    // Ask for business name
+    let response = '🏢 *Pilih Bisnis*\n\nBisnis Anda:\n';
+    businesses.forEach((b, i) => {
+        response += `${i + 1}. ${b.name}\n`;
+    });
+    response += '\nSilakan kirim nama bisnis yang ingin digunakan.';
+    response += '\n\nJika ingin login ke bisnis milik orang lain, kirim nama bisnis tersebut (anda akan diminta username & password).';
+    
+    await msg.reply(response);
+    
+    // Store state
+    if (!client.businessLoginState) {
+        client.businessLoginState = new Map();
+    }
+    client.businessLoginState.set(userId, { stage: 'waiting_business_name' });
+}
+
+async function handleBusinessMode(msg, activeSession) {
+    const userId = msg.from;
+    const text = msg.body.trim().toLowerCase();
+    
+    // Check for exit command first (before AI)
+    if (text === 'keluar' || text === 'exit') {
+        await businessManager.endBusinessSession(userId);
+        await msg.reply('✅ Keluar dari mode bisnis.');
+        return;
+    }
+    
+    // Get business context
+    const businessId = activeSession.business_id;
+    const businessName = activeSession.business_name;
+
+    // Quick parse: handle freeform "update <product>, bahan: ..." before calling AI
+    try {
+        const parsedUpdate = parseCatalogUpdateText(msg.body);
+        if (parsedUpdate && parsedUpdate.bahanText) {
+            const providedName = parsedUpdate.productName;
+            // find catalog by name
+            const catalog = await businessManager.getCatalogByName(businessId, providedName);
+            if (!catalog) {
+                // try fuzzy lookup among catalogs
+                const catalogs = await businessManager.getCatalogs(businessId);
+                const best = catalogs.find(c => normalizeName(c.name) === normalizeName(providedName)) || catalogs.find(c => normalizeName(c.name).includes(normalizeName(providedName))) || null;
+                if (!best) {
+                    // let AI handle or reply
+                    // continue to AI decision
+                } else {
+                    // set catalog as found
+                    // proceed to update using best
+                    const materialsText = parsedUpdate.bahanText;
+                    const availableMaterials = await businessManager.getMaterials(businessId);
+                    const normalizedMaterialsText = normalizeName(materialsText);
+                    const found = [];
+                    const foundMaterialTokens = new Set();
+                    for (const m of availableMaterials) {
+                        const mn = normalizeName(m.name);
+                        if (normalizedMaterialsText.includes(mn)) {
+                            // attempt to find quantity near material name
+                            const tokenRegex = mn.split(' ').map(t => t.trim()).filter(Boolean).join('\\\\s+');
+                            const reAfter = new RegExp(tokenRegex + '\\s*(\\d+)', 'i');
+                            const reBefore = new RegExp('(\\\\d+)\\s*' + tokenRegex, 'i');
+                            let qty = 1;
+                            const matchAfter = materialsText.match(reAfter);
+                            const matchBefore = materialsText.match(reBefore);
+                            if (matchAfter && matchAfter[1]) qty = Number(matchAfter[1]);
+                            else if (matchBefore && matchBefore[1]) qty = Number(matchBefore[1]);
+
+                            found.push({ name: m.name, quantity: qty, unit_price: m.unit_price, pack_price: m.pack_price, per_pack: m.per_pack });
+                            mn.split(' ').forEach(t => t && foundMaterialTokens.add(t));
+                        }
+                    }
+
+                    // Collect not-found tokens to store as unknown parts
+                    const stopwords = new Set(['k','rb','ribu','per','pack','pcs','kg','g','unit','buah','pc','katalog','harga','jual']);
+                    const captionTokens = normalizedMaterialsText.split(' ').filter(Boolean);
+                    const productNameTokens = normalizeName(providedName).split(' ').filter(Boolean);
+                    const notFoundSet = new Set();
+                    for (const tok of captionTokens) {
+                        if (!tok) continue;
+                        if (productNameTokens.includes(tok)) continue;
+                        if (stopwords.has(tok)) continue;
+                        if (/^\d+$/.test(tok)) continue;
+                        if (foundMaterialTokens.has(tok)) continue;
+                        notFoundSet.add(tok);
+                    }
+
+                    const notFound = Array.from(notFoundSet);
+                    const productionMaterials = [];
+                    for (const f of found) {
+                        productionMaterials.push({ name: f.name, quantity: f.quantity, matchedName: f.name, unit_price: f.unit_price || null, found: true });
+                    }
+                    for (const nf of notFound) {
+                        productionMaterials.push({ name: nf, quantity: null, matchedName: null, unit_price: null, found: false });
+                    }
+
+                    let productionCost = null;
+                    if (found.length > 0) {
+                        const calcInput = found.map(f => ({ unit_price: f.unit_price, quantity: f.quantity }));
+                        productionCost = businessManager.calculateCost(calcInput);
+                    }
+
+                    // Update catalog (include price if parsed)
+                    try {
+                        const updates = { production_cost: productionCost, production_materials: productionMaterials };
+                        if (parsedUpdate.price !== undefined && parsedUpdate.price !== null) updates.price = parsedUpdate.price;
+                        const ok = await businessManager.updateCatalog(best.id, updates);
+                        if (ok) {
+                            let reply = `✅ Komposisi katalog *${best.name}* diperbarui.`;
+                            if (productionCost !== null) reply += `\n💵 Total estimasi biaya: ${formatCurrency(productionCost)}`;
+                            if (updates.price !== undefined) reply += `\n💰 Harga jual diupdate: ${formatCurrency(updates.price)}`;
+                            await msg.reply(reply);
+                            return; // handled — don't call AI
+                        }
+                    } catch (err) {
+                        console.error('Error updating catalog from freeform update:', err);
+                    }
+                }
+            } else {
+                // catalog exists directly
+                const materialsText = parsedUpdate.bahanText;
+                const availableMaterials = await businessManager.getMaterials(businessId);
+                const normalizedMaterialsText = normalizeName(materialsText);
+                const found = [];
+                const foundMaterialTokens = new Set();
+                for (const m of availableMaterials) {
+                    const mn = normalizeName(m.name);
+                    if (normalizedMaterialsText.includes(mn)) {
+                        const tokenRegex = mn.split(' ').map(t => t.trim()).filter(Boolean).join('\\\\s+');
+                        const reAfter = new RegExp(tokenRegex + '\\s*(\\d+)', 'i');
+                        const reBefore = new RegExp('(\\\\d+)\\s*' + tokenRegex, 'i');
+                        let qty = 1;
+                        const matchAfter = materialsText.match(reAfter);
+                        const matchBefore = materialsText.match(reBefore);
+                        if (matchAfter && matchAfter[1]) qty = Number(matchAfter[1]);
+                        else if (matchBefore && matchBefore[1]) qty = Number(matchBefore[1]);
+
+                        found.push({ name: m.name, quantity: qty, unit_price: m.unit_price, pack_price: m.pack_price, per_pack: m.per_pack });
+                        mn.split(' ').forEach(t => t && foundMaterialTokens.add(t));
+                    }
+                }
+
+                const stopwords = new Set(['k','rb','ribu','per','pack','pcs','kg','g','unit','buah','pc','katalog','harga','jual']);
+                const captionTokens = normalizedMaterialsText.split(' ').filter(Boolean);
+                const productNameTokens = normalizeName(providedName).split(' ').filter(Boolean);
+                const notFoundSet = new Set();
+                for (const tok of captionTokens) {
+                    if (!tok) continue;
+                    if (productNameTokens.includes(tok)) continue;
+                    if (stopwords.has(tok)) continue;
+                    if (/^\d+$/.test(tok)) continue;
+                    if (foundMaterialTokens.has(tok)) continue;
+                    notFoundSet.add(tok);
+                }
+
+                const notFound = Array.from(notFoundSet);
+                const productionMaterials = [];
+                for (const f of found) {
+                    productionMaterials.push({ name: f.name, quantity: f.quantity, matchedName: f.name, unit_price: f.unit_price || null, found: true });
+                }
+                for (const nf of notFound) {
+                    productionMaterials.push({ name: nf, quantity: null, matchedName: null, unit_price: null, found: false });
+                }
+
+                let productionCost = null;
+                if (found.length > 0) {
+                    const calcInput = found.map(f => ({ unit_price: f.unit_price, quantity: f.quantity }));
+                    productionCost = businessManager.calculateCost(calcInput);
+                }
+
+                try {
+                    const updates = { production_cost: productionCost, production_materials: productionMaterials };
+                    if (parsedUpdate.price !== undefined && parsedUpdate.price !== null) updates.price = parsedUpdate.price;
+                    const ok = await businessManager.updateCatalog(catalog.id, updates);
+                    if (ok) {
+                        let reply = `✅ Komposisi katalog *${catalog.name}* diperbarui.`;
+                        if (productionCost !== null) reply += `\n💵 Total estimasi biaya: ${formatCurrency(productionCost)}`;
+                        if (updates.price !== undefined) reply += `\n💰 Harga jual diupdate: ${formatCurrency(updates.price)}`;
+                        await msg.reply(reply);
+                        return; // handled — don't call AI
+                    }
+                } catch (err) {
+                    console.error('Error updating catalog from freeform update:', err);
+                }
+            }
+        }
+    } catch (err) {
+        console.error('Freeform catalog update parse error:', err);
+    }
+    
+    // Quick handling: if user asked "katalog <nama>", show that specific catalog
+    try {
+        const katalogMatch = msg.body.trim().match(/^katalog\s+(.+)/i);
+        if (katalogMatch) {
+            const requestedName = katalogMatch[1].trim();
+            await handleShowCatalogs(msg, businessId, businessName, requestedName);
+            return;
+        }
+    } catch (err) {
+        // ignore and continue to other handlers
+    }
+    // Special handling for catalog with image: trigger if caption mentions 'katalog' or matches "<name> <price>" pattern
+    if (msg.hasMedia) {
+        const caption = text || '';
+        const captionLooksLikeProduct = /(.+?)\s+(\d+[krb]*)/i.test(caption);
+        if (caption.toLowerCase().includes('katalog') || captionLooksLikeProduct) {
+            await handleAddCatalog(msg, businessId);
+            return;
+        }
+    }
+    
+    // Get business stats for context
+    const stats = await businessManager.getBusinessStats(businessId);
+    const businessContext = {
+        businessName: businessName,
+        materialsCount: stats.materialsCount,
+        catalogsCount: stats.catalogsCount
+    };
+    
+    // Use AI to decide action
+    const history = getChatHistory(userId, 5);
+    console.log(`📨 Business message from ${userId}: ${text}`);
+    
+    const decision = await aiDecideBusinessAction(msg.body.trim(), history, businessContext);
+    
+    if (!decision) {
+        console.log('⚠️ Business mode: AI returned null - no response sent');
+        return;
+    }
+    
+    console.log(`🤖 Business AI Action: ${decision.action}`);
+    console.log(`📋 Reasoning: ${decision.reasoning}`);
+    
+    // Execute action based on AI decision
+    try {
+        if (decision.action === 'add_material') {
+            const { name, unitPrice, packPrice, perPack } = decision.params;
+
+            try {
+                const existing = await businessManager.getMaterialByName(businessId, name);
+                if (existing) {
+                    const updates = {};
+                    if (unitPrice !== undefined) updates.unit_price = unitPrice;
+                    if (packPrice !== undefined) updates.pack_price = packPrice || null;
+                    if (perPack !== undefined) updates.per_pack = perPack || null;
+
+                    if (Object.keys(updates).length === 0) {
+                        await msg.reply(`⚠️ Tidak ada perubahan untuk bahan *${name}*.`);
+                    } else {
+                        await businessManager.updateMaterial(businessId, name, updates);
+                        let response = `✅ Bahan *${name}* diperbarui:`;
+                        if (updates.unit_price !== undefined) response += `\n• Per unit: ${formatCurrency(updates.unit_price)}`;
+                        if (updates.pack_price !== undefined) response += `\n• Per pack: ${updates.pack_price ? formatCurrency(updates.pack_price) : 'dihapus'}`;
+                        await msg.reply(response);
+                        addToChatHistory(userId, response, 'bot');
+                    }
+                } else {
+                    await businessManager.addMaterial(businessId, name, unitPrice, packPrice || null, perPack || null);
+                    let response = `✅ Bahan *${name}* ditambahkan:`;
+                    if (unitPrice !== undefined) response += `\n• Per unit: ${formatCurrency(unitPrice)}`;
+                    if (packPrice) response += `\n• Per pack: ${formatCurrency(packPrice)}`;
+                    await msg.reply(response);
+                    addToChatHistory(userId, response, 'bot');
+                }
+            } catch (error) {
+                console.error('add_material error:', error);
+                await msg.reply('❌ Gagal menambahkan atau memperbarui bahan.');
+            }
+        }
+        else if (decision.action === 'list_materials') {
+            await handleListMaterials(msg, businessId, businessName);
+        }
+        else if (decision.action === 'list_price_tiers') {
+            await handleListPriceTiers(msg, businessId, businessName);
+        }
+        else if (decision.action === 'add_price_tier') {
+            const { price } = decision.params;
+            // Detect if the user likely intended to add a catalog item: "<name> <price>" (e.g. "bunga matahari 12k")
+            try {
+                let productName = null;
+                const tokens = text.split(/\s+/);
+                for (let i = 0; i < tokens.length; i++) {
+                    const tok = tokens[i];
+                    const parsed = parseAmount(tok);
+                    if (!isNaN(parsed) && parsed === price) {
+                        // product name is the tokens before this token
+                        productName = tokens.slice(0, i).join(' ').trim();
+                        break;
+                    }
+                }
+
+                    if (productName && productName.length > 0) {
+                    // Create catalog item automatically (no image)
+                    await businessManager.addCatalog(businessId, productName, price, null, null);
+                    await msg.reply(`✅ Katalog *${productName}* ditambahkan dengan harga ${formatCurrency(price)}.`);
+                    addToChatHistory(userId, `Katalog ${productName} ditambahkan`, 'bot');
+                } else {
+                    // Fallback: treat as price tier
+                    await businessManager.addPriceTier(businessId, price);
+                    await msg.reply(`✅ Harga jual ${formatCurrency(price)} berhasil ditambahkan.`);
+                    addToChatHistory(userId, `Harga jual ${price} ditambahkan`, 'bot');
+                }
+            } catch (error) {
+                if (error && error.message === 'PRICE_ALREADY_EXISTS') {
+                    await msg.reply(`⚠️ Harga jual ${formatCurrency(price)} sudah ada.`);
+                } else if (error && error.message === 'MATERIAL_ALREADY_EXISTS') {
+                    await msg.reply('⚠️ Item sudah ada.');
+                } else {
+                    console.error('❌ add_price_tier error:', error);
+                    await msg.reply('❌ Gagal menambahkan harga jual atau katalog.');
+                }
+            }
+        }
+        else if (decision.action === 'calculate_cost') {
+            // decision.params should contain requestedMaterials: [{name, quantity}, ...]
+            const requestedMaterials = decision.params?.materials || [];
+            const availableMaterials = await businessManager.getMaterials(businessId);
+            const usedMaterials = [];
+            const notFoundMaterials = [];
+            let totalCost = 0;
+
+            // compute costs, handle pack_price/per_pack fallback
+            requestedMaterials.forEach(rm => {
+                const material = findMaterialByName(availableMaterials, rm.name);
+                if (material) {
+                    let unitPrice = material.unit_price;
+                    // derive unit price from pack if unit missing and per_pack present
+                    if ((unitPrice === null || unitPrice === undefined) && material.pack_price && material.per_pack) {
+                        unitPrice = Number(material.pack_price) / Number(material.per_pack);
+                    }
+
+                    const qty = Number(rm.quantity) || 0;
+                    const cost = (unitPrice ? Number(unitPrice) : 0) * qty;
+                    usedMaterials.push({
+                        name: material.name,
+                        requestedName: rm.name,
+                        quantity: qty,
+                        unitPrice: unitPrice || null,
+                        packPrice: material.pack_price || null,
+                        perPack: material.per_pack || null,
+                        cost: cost
+                    });
+                    totalCost += cost;
+                } else {
+                    notFoundMaterials.push(rm.name);
+                }
+            });
+            
+            if (usedMaterials.length === 0) {
+                let reply = '❌ Tidak ditemukan bahan yang valid dalam pesan Anda.';
+                if (notFoundMaterials.length > 0) reply += `\nBahan yang tidak dikenali: ${notFoundMaterials.join(', ')}`;
+                await msg.reply(reply);
+                return;
+            }
+            
+            // Build response with detailed breakdown
+            let response = '💰 *Perhitungan Biaya*\n\n';
+            response += '📋 *Bahan yang digunakan:*\n';
+            usedMaterials.forEach(m => {
+                const displayName = m.name || m.requestedName;
+                const unitText = m.unitPrice ? formatCurrency(m.unitPrice) : (m.packPrice ? `${formatCurrency(m.packPrice)} per ${m.perPack || '?'} pack` : 'harga tidak tersedia');
+                response += `• ${displayName}: ${m.quantity} × ${unitText} = ${formatCurrency(m.cost)}\n`;
+            });
+            response += `\n💵 *Total Cost: ${formatCurrency(totalCost)}*\n\n`;
+
+            // Suggest price and nearest price tier
+            const suggestedPrice = await businessManager.suggestSellingPrice(businessId, totalCost);
+            const priceTiers = await businessManager.getPriceTiers(businessId);
+            let nearestTier = null;
+            if (priceTiers && priceTiers.length > 0) {
+                // Prefer the nearest tier that is >= totalCost (don't pick tiers below cost)
+                const tiersAboveOrEqual = priceTiers.filter(pt => Number(pt.price) >= totalCost).map(pt => Number(pt.price));
+                if (tiersAboveOrEqual.length > 0) {
+                    // choose smallest tier >= totalCost
+                    tiersAboveOrEqual.sort((a, b) => a - b);
+                    nearestTier = tiersAboveOrEqual[0];
+                } else {
+                    // No tier above or equal to total cost
+                    nearestTier = null;
+                }
+            }
+
+            response += `💡 *Saran Harga Jual (AI): ${formatCurrency(suggestedPrice)}*\n`;
+            response += `   (Estimasi Profit: ${formatCurrency(suggestedPrice - totalCost)})\n`;
+            if (nearestTier) {
+                response += `🏷️ *Harga Jual Terdekat (>= biaya):* ${formatCurrency(nearestTier)}\n`;
+                response += `   (Profit jika pilih tier terdekat: ${formatCurrency(nearestTier - totalCost)})\n`;
+            } else if (priceTiers.length === 0) {
+                response += `🏷️ Tidak ada harga jual terkonfigurasi untuk bisnis ini.\n`;
+            } else {
+                // There are tiers but none above cost
+                const highest = priceTiers[priceTiers.length - 1].price;
+                response += `🏷️ Tidak ada harga jual terdekat yang >= total cost. Harga tertinggi saat ini ${formatCurrency(highest)} (masih di bawah cost).\n`;
+                response += `   Pertimbangkan menggunakan saran AI ${formatCurrency(suggestedPrice)} atau tambahkan tier yang lebih tinggi.\n`;
+            }
+
+            response += `\n✳️ Catatan: Harga jual terdekat yang ditampilkan hanya memilih tier yang tidak membuat profit negatif (>= total cost). AI tetap dapat menyarankan harga di luar daftar jika diperlukan.`;
+            if (notFoundMaterials.length > 0) {
+                response += `\n\n⚠️ Bahan tidak dikenali: ${notFoundMaterials.join(', ')}. Pastikan bahan sudah ditambahkan ke daftar bahan bisnis Anda.`;
+            }
+            
+            await msg.reply(response);
+            addToChatHistory(userId, response, 'bot');
+        }
+        else if (decision.action === 'add_catalog') {
+            // AI requested to add or update a catalog. Support both: update existing or create new.
+            const { name, price, materials: aiMaterials, productionCost } = decision.params || {};
+            if (!name) {
+                await msg.reply('❌ Nama katalog tidak diberikan. Sertakan nama katalog pada perintah.');
+                return;
+            }
+
+            try {
+                const existing = await businessManager.getCatalogByName(businessId, name);
+
+                // Build productionMaterials from provided materials list if present
+                let productionMaterials = null;
+                let computedProductionCost = productionCost !== undefined ? productionCost : null;
+                if (Array.isArray(aiMaterials) && aiMaterials.length > 0) {
+                    const availableMaterials = await businessManager.getMaterials(businessId);
+                    const calcInput = [];
+                    productionMaterials = [];
+
+                    for (const m of aiMaterials) {
+                        const requestedName = m.name || m.material || m.item || '';
+                        const qty = Number(m.quantity || m.qty || m.count || 0) || 1;
+                        const mat = findMaterialByName(availableMaterials, requestedName);
+                        if (mat) {
+                            // derive unit price if missing
+                            let unit = mat.unit_price;
+                            if ((unit === null || unit === undefined) && mat.pack_price && mat.per_pack) {
+                                unit = Number(mat.pack_price) / Number(mat.per_pack);
+                            }
+                            calcInput.push({ unit_price: unit || 0, quantity: qty });
+                            productionMaterials.push({ name: requestedName, quantity: qty, matchedName: mat.name, unit_price: mat.unit_price || null, found: true });
+                        } else {
+                            productionMaterials.push({ name: requestedName, quantity: qty, matchedName: null, unit_price: null, found: false });
+                        }
+                    }
+
+                    if (calcInput.length > 0 && computedProductionCost === null) {
+                        computedProductionCost = businessManager.calculateCost(calcInput);
+                    }
+                }
+
+                if (existing) {
+                    const updates = {};
+                    if (price !== undefined) updates.price = price;
+                    if (computedProductionCost !== null) updates.production_cost = computedProductionCost;
+                    if (productionMaterials !== null) updates.production_materials = productionMaterials;
+
+                    if (Object.keys(updates).length === 0) {
+                        await msg.reply('⚠️ Tidak ada data untuk diupdate pada katalog. Sertakan `price` atau `materials`.');
+                        return;
+                    }
+
+                    const ok = await businessManager.updateCatalog(existing.id, updates);
+                    if (ok) {
+                        let reply = `✅ Katalog *${existing.name}* diperbarui.`;
+                        if (computedProductionCost !== null) reply += `\n💵 Estimasi Biaya Produksi: ${formatCurrency(computedProductionCost)}`;
+                        if (price !== undefined) reply += `\n💰 Harga jual: ${formatCurrency(price)}`;
+                        await msg.reply(reply);
+                        addToChatHistory(userId, reply, 'bot');
+                    } else {
+                        await msg.reply('❌ Gagal memperbarui katalog.');
+                    }
+                } else {
+                    // Creating new catalog: require price (because DB schema requires price NOT NULL)
+                    if (price === undefined || price === null) {
+                        await msg.reply('❗ Untuk menambahkan katalog baru, mohon sertakan harga jual. Contoh: "daun v2 6000" atau kirim "tambahkan katalog daun v2 6000"');
+                        return;
+                    }
+
+                    // No image here; create catalog record without image
+                    await businessManager.addCatalog(businessId, name, price, null, computedProductionCost, productionMaterials);
+                    let reply = `✅ Katalog *${name}* ditambahkan dengan harga ${formatCurrency(price)}`;
+                    if (computedProductionCost !== null) reply += `\n💵 Estimasi Biaya Produksi: ${formatCurrency(computedProductionCost)}`;
+                    await msg.reply(reply);
+                    addToChatHistory(userId, reply, 'bot');
+                }
+            } catch (err) {
+                console.error('add_catalog error (business):', err);
+                await msg.reply('❌ Gagal menambahkan atau memperbarui katalog.');
+            }
+        }
+        else if (decision.action === 'show_catalogs') {
+            const requestedName = decision.params?.name || null;
+            await handleShowCatalogs(msg, businessId, businessName, requestedName);
+        }
+        else if (decision.action === 'edit_material') {
+            const { name } = decision.params || {};
+            const updates = {};
+            if (decision.params.unitPrice !== undefined) updates.unit_price = decision.params.unitPrice;
+            if (decision.params.packPrice !== undefined) updates.pack_price = decision.params.packPrice;
+            if (decision.params.perPack !== undefined) updates.per_pack = decision.params.perPack;
+
+            if (!name) {
+                await msg.reply('❌ Nama bahan tidak diberikan untuk edit.');
+                return;
+            }
+
+            try {
+                const ok = await businessManager.updateMaterial(businessId, name, updates);
+                if (ok) {
+                    await msg.reply(`✅ Bahan *${name}* berhasil diupdate.`);
+                } else {
+                    await msg.reply(`⚠️ Tidak ada perubahan atau bahan *${name}* tidak ditemukan.`);
+                }
+            } catch (err) {
+                console.error('edit_material error:', err);
+                await msg.reply('❌ Gagal mengupdate bahan.');
+            }
+        }
+        else if (decision.action === 'delete_material') {
+            const name = decision.params?.name;
+            try {
+                if (name) {
+                    const ok = await businessManager.deleteMaterialByName(businessId, name);
+                    if (ok) await msg.reply(`✅ Bahan *${name}* dihapus.`);
+                    else await msg.reply(`⚠️ Bahan *${name}* tidak ditemukan.`);
+                } else {
+                    // delete all
+                    await businessManager.deleteAllMaterials(businessId);
+                    await msg.reply('✅ Semua bahan telah dihapus.');
+                }
+            } catch (err) {
+                console.error('delete_material error:', err);
+                await msg.reply('❌ Gagal menghapus bahan.');
+            }
+        }
+        else if (decision.action === 'add_expense') {
+            let { description, amount } = decision.params;
+            
+            // If amount is 0, try to get from materials
+            if (amount === 0) {
+                const materials = await businessManager.getMaterials(businessId);
+                for (const m of materials) {
+                    if (description.toLowerCase().includes(m.name.toLowerCase())) {
+                        if (m.pack_price && (description.includes('pack') || description.includes('gulung'))) {
+                            amount = m.pack_price;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (amount === 0) {
+                await msg.reply('❌ Tidak dapat menentukan jumlah. Silakan sertakan harga atau pastikan bahan sudah terdaftar dengan harga pack.');
+                return;
+            }
+            
+            try {
+                await businessManager.addExpense(businessId, description, amount);
+                await msg.reply(`✅ Pengeluaran dicatat:\n${description}\n💰 ${formatCurrency(amount)}\n\n_Status: Belum dicatat ke Excel_`);
+            } catch (error) {
+                await msg.reply('❌ Gagal mencatat pengeluaran.');
+            }
+        }
+        else if (decision.action === 'edit_catalog') {
+            const { id, name, price, newName, production_cost, production_materials } = decision.params || {};
+            try {
+                let ok = false;
+                const updates = {};
+                if (newName !== undefined || name !== undefined) updates.name = newName || name;
+                if (price !== undefined) updates.price = price;
+                if (production_cost !== undefined) updates.production_cost = production_cost;
+                if (production_materials !== undefined) updates.production_materials = production_materials;
+
+                if (Object.keys(updates).length === 0) {
+                    await msg.reply('⚠️ Tidak ada data untuk diupdate. Sertakan field seperti `price`, `production_cost`, atau `production_materials`.');
+                    return;
+                }
+
+                if (id) {
+                    ok = await businessManager.updateCatalog(id, updates);
+                } else if (name) {
+                    const cat = await businessManager.getCatalogByName(businessId, name);
+                    if (cat) ok = await businessManager.updateCatalog(cat.id, updates);
+                }
+
+                if (ok) await msg.reply('✅ Katalog berhasil diupdate.');
+                else await msg.reply('⚠️ Katalog tidak ditemukan atau tidak ada perubahan.');
+            } catch (err) {
+                console.error('edit_catalog error:', err);
+                await msg.reply('❌ Gagal mengupdate katalog.');
+            }
+        }
+        else if (decision.action === 'delete_catalog') {
+            try {
+                if (decision.params?.id) {
+                    await businessManager.deleteCatalog(decision.params.id);
+                    await msg.reply('✅ Katalog berhasil dihapus.');
+                } else if (decision.params?.name) {
+                    const requestedName = decision.params.name;
+                    const cat = await businessManager.getCatalogByName(businessId, requestedName);
+                    if (cat) {
+                        await businessManager.deleteCatalog(cat.id);
+                        await msg.reply(`✅ Katalog *${cat.name}* dihapus.`);
+                    } else {
+                        // Try fuzzy lookup among catalogs
+                        const catalogs = await businessManager.getCatalogs(businessId);
+                        const target = normalizeName(requestedName);
+                        const targetTokens = new Set(target.split(' ').filter(Boolean));
+                        let best = null; let bestScore = 0;
+                        const scored = [];
+                        for (const c of catalogs) {
+                            const cn = normalizeName(c.name);
+                            const ctokens = cn.split(' ').filter(Boolean);
+                            let score = 0;
+                            for (const t of ctokens) if (targetTokens.has(t)) score++;
+                            if (score > 0) scored.push({ catalog: c, score });
+                            if (score > bestScore) { bestScore = score; best = c; }
+                        }
+
+                        if (best && (normalizeName(best.name).includes(target) || target.includes(normalizeName(best.name)) || bestScore >= 2)) {
+                            // strong match — perform delete
+                            await businessManager.deleteCatalog(best.id);
+                            await msg.reply(`✅ Katalog *${best.name}* (cocok dengan "${requestedName}") telah dihapus.`);
+                        } else if (scored.length > 0) {
+                            // suggest candidates
+                            scored.sort((a, b) => b.score - a.score);
+                            const options = scored.slice(0, 5).map((s, i) => `${i + 1}. ${s.catalog.name}`).join('\n');
+                            let reply = `⚠️ Katalog "${requestedName}" tidak ditemukan secara tepat. Mungkin Anda maksud salah satu dari berikut:\n${options}\n\nBalas dengan ` + "'hapus katalog <nama>'" + ` atau kirim 'hapus katalog nomor' (mis. 'hapus katalog 1').`;
+                            await msg.reply(reply);
+                        } else {
+                            await msg.reply('⚠️ Katalog tidak ditemukan. Periksa kembali ejaan atau tampilkan daftar katalog untuk melihat nama yang tersedia.');
+                        }
+                    }
+                } else {
+                    await msg.reply('❌ Harap sebutkan nama atau id katalog yang ingin dihapus, atau gunakan "hapus semua katalog".');
+                }
+            } catch (err) {
+                console.error('delete_catalog error:', err);
+                await msg.reply('❌ Gagal menghapus katalog.');
+            }
+        }
+        else if (decision.action === 'delete_all_catalogs') {
+            try {
+                await businessManager.deleteAllCatalogs(businessId);
+                await msg.reply('✅ Semua katalog telah dihapus.');
+            } catch (err) {
+                console.error('delete_all_catalogs error:', err);
+                await msg.reply('❌ Gagal menghapus semua katalog.');
+            }
+        }
+        else if (decision.action === 'delete_all_price_tiers') {
+            try {
+                await businessManager.deleteAllPriceTiers(businessId);
+                await msg.reply('✅ Semua harga jual telah dihapus.');
+            } catch (err) {
+                console.error('delete_all_price_tiers error:', err);
+                await msg.reply('❌ Gagal menghapus harga jual.');
+            }
+        }
+        else if (decision.action === 'show_examples') {
+            const examples = `Contoh input untuk bahan/katalog:\n• 1 pack kawat bulu 14k\n• 1 unit kawat bulu 500 perak\n• tambahkan katalog bunga mawar 12k (kirim foto + caption)\n• tambahkan bahan kawat bulu 1 unit 500\n\nContoh hapus/edit:\n• hapus pack kawat bulu\n• hapus unit kawat bulu\n• edit unit kawat bulu jadi 600 perak\n• hapus semua bahan\n• hapus semua katalog`;
+            await msg.reply(examples);
+        }
+        else if (decision.action === 'show_expenses') {
+            await handleShowExpenses(msg, businessId, businessName);
+        }
+        else if (decision.action === 'mark_expense_recorded') {
+            const { number } = decision.params;
+            const unrecordedExpenses = await businessManager.getExpenses(businessId, false);
+            
+            if (number < 1 || number > unrecordedExpenses.length) {
+                await msg.reply(`❌ Nomor tidak valid. Ada ${unrecordedExpenses.length} pengeluaran yang belum dicatat.`);
+                return;
+            }
+            
+            const expense = unrecordedExpenses[number - 1];
+            
+            try {
+                await businessManager.markExpenseAsRecorded(expense.id);
+                await msg.reply(`✅ Pengeluaran "${expense.description}" sudah ditandai sebagai tercatat.`);
+            } catch (error) {
+                await msg.reply('❌ Gagal menandai pengeluaran.');
+            }
+        }
+        else if (decision.action === 'add_income') {
+            const { description, amount } = decision.params;
+            
+            try {
+                await businessManager.addIncome(businessId, description, amount);
+                await msg.reply(`✅ Pemasukan dicatat:\n${description}\n💰 ${formatCurrency(amount)}`);
+            } catch (error) {
+                await msg.reply('❌ Gagal mencatat pemasukan.');
+            }
+        }
+        else if (decision.action === 'show_stats') {
+            await handleBusinessStats(msg, businessId, businessName);
+        }
+        else if (decision.action === 'help') {
+            await handleBusinessHelp(msg, businessName);
+        }
+        else if (decision.action === 'multi_command') {
+            const commands = decision.params?.commands || [];
+            const results = [];
+
+            for (const cmd of commands) {
+                try {
+                    if (cmd.type === 'add_material') {
+                        try {
+                            const existing = await businessManager.getMaterialByName(businessId, cmd.name);
+                            if (existing) {
+                                const updates = {};
+                                if (cmd.unitPrice !== undefined) updates.unit_price = cmd.unitPrice;
+                                if (cmd.packPrice !== undefined) updates.pack_price = cmd.packPrice || null;
+                                if (cmd.perPack !== undefined) updates.per_pack = cmd.perPack || null;
+
+                                if (Object.keys(updates).length > 0) {
+                                    await businessManager.updateMaterial(businessId, cmd.name, updates);
+                                    results.push(`✅ Bahan *${cmd.name}* diperbarui`);
+                                } else {
+                                    results.push(`⚠️ Tidak ada perubahan untuk *${cmd.name}*`);
+                                }
+                            } else {
+                                await businessManager.addMaterial(businessId, cmd.name, cmd.unitPrice, cmd.packPrice || null, cmd.perPack || null);
+                                results.push(`✅ Bahan *${cmd.name}* ditambahkan`);
+                            }
+                        } catch (err) {
+                            console.error('multi add_material inner error:', err);
+                            results.push(`❌ Gagal menambahkan/ memperbarui *${cmd.name}*: ${err.message || err}`);
+                        }
+                    } else if (cmd.type === 'add_price_tier') {
+                        await businessManager.addPriceTier(businessId, cmd.price);
+                        results.push(`✅ Harga jual ${formatCurrency(cmd.price)} ditambahkan`);
+                    } else if (cmd.type === 'add_catalog') {
+                        try {
+                            let productionCost = null;
+                            if (cmd.productionCost !== undefined) {
+                                productionCost = cmd.productionCost;
+                            } else if (cmd.materials && Array.isArray(cmd.materials) && cmd.materials.length > 0) {
+                                // cmd.materials expected: [{name, quantity},...]
+                                const availableMaterials = await businessManager.getMaterials(businessId);
+                                const calcInput = [];
+                                for (const m of cmd.materials) {
+                                    const mat = findMaterialByName(availableMaterials, m.name);
+                                    if (mat) {
+                                        const unit = (mat.unit_price === null || mat.unit_price === undefined) ? (mat.pack_price && mat.per_pack ? Number(mat.pack_price)/Number(mat.per_pack) : 0) : Number(mat.unit_price);
+                                        calcInput.push({ unit_price: unit, quantity: Number(m.quantity) || 0 });
+                                    }
+                                }
+                                    if (calcInput.length > 0) productionCost = businessManager.calculateCost(calcInput);
+                                    // build productionMaterials from cmd.materials
+                                    const productionMaterials = [];
+                                    for (const m of cmd.materials) {
+                                        const mat = findMaterialByName(availableMaterials, m.name);
+                                        if (mat) {
+                                            productionMaterials.push({ name: mat.name, quantity: Number(m.quantity) || null, matchedName: mat.name, unit_price: mat.unit_price || null, found: true });
+                                        } else {
+                                            productionMaterials.push({ name: m.name, quantity: Number(m.quantity) || null, matchedName: null, unit_price: null, found: false });
+                                        }
+                                    }
+                                }
+
+                                await businessManager.addCatalog(businessId, cmd.name, cmd.price, null, productionCost, productionMaterials);
+                                let resText = `✅ Katalog *${cmd.name}* ditambahkan`;
+                                if (productionCost !== null) resText += ` (estimasi biaya: ${formatCurrency(productionCost)})`;
+                                results.push(resText);
+                        } catch (err) {
+                            console.error('multi add_catalog error:', err);
+                            results.push(`❌ Gagal menambahkan katalog *${cmd.name}*: ${err.message || err}`);
+                        }
+                    } else if (cmd.type === 'list_catalogs_by_price') {
+                        try {
+                            const price = cmd.price;
+                            if (price === undefined || price === null) {
+                                results.push('❌ Perintah list_catalogs_by_price butuh parameter price');
+                            } else {
+                                const catalogs = await businessManager.getCatalogsByPrice(businessId, price);
+                                if (!catalogs || catalogs.length === 0) {
+                                    results.push(`📸 Tidak ada katalog dengan harga jual ${formatCurrency(price)}`);
+                                } else {
+                                    // Send header first
+                                    await msg.reply(`📸 *Katalog dengan Harga ${formatCurrency(price)} - ${activeSession.business_name}*\n\nMengirim ${catalogs.length} item...`);
+                                    for (let i = 0; i < catalogs.length; i++) {
+                                        const catalog = catalogs[i];
+                                        if (catalog.image_path && fs.existsSync(catalog.image_path)) {
+                                            try {
+                                                const media = MessageMedia.fromFilePath(catalog.image_path);
+                                                let caption = `${i + 1}. *${catalog.name}*\n💰 ${formatCurrency(catalog.price)}`;
+                                                if (catalog.production_cost) caption += `\n💵 Biaya produksi: ${formatCurrency(catalog.production_cost)}`;
+                                                await client.sendMessage(msg.from, media, { caption });
+                                                if (i < catalogs.length - 1) await new Promise(res => setTimeout(res, 800));
+                                                // send details
+                                                try {
+                                                    let detailMsg = `*${catalog.name}*\n\n*Bahan yang digunakan:*\n`;
+                                                    if (catalog.production_materials && Array.isArray(catalog.production_materials) && catalog.production_materials.length > 0) {
+                                                        for (const pm of catalog.production_materials) {
+                                                            if (pm.found) {
+                                                                const qtyText = pm.quantity !== null && pm.quantity !== undefined ? `${pm.quantity} ` : '';
+                                                                detailMsg += `• ${qtyText}${pm.matchedName || pm.name}\n`;
+                                                            } else {
+                                                                detailMsg += `• ${pm.name} (tidak dikenali)\n`;
+                                                            }
+                                                        }
+                                                    } else {
+                                                        detailMsg += `• (tidak ada data bahan)\n`;
+                                                    }
+                                                    detailMsg += `\n*Total Cost:* ${catalog.production_cost ? formatCurrency(catalog.production_cost) : '—'}\n`;
+                                                    detailMsg += `*Harga Jual:* ${formatCurrency(catalog.price)}`;
+                                                    await msg.reply(detailMsg);
+                                                } catch (err) { }
+                                            } catch (err) {
+                                                console.error('Error sending catalog item (multi):', err);
+                                                await msg.reply(`${i + 1}. *${catalog.name}* - ${formatCurrency(catalog.price)}\n(Gambar tidak tersedia)`);
+                                            }
+                                        } else {
+                                            let line = `${i + 1}. *${catalog.name}* - ${formatCurrency(catalog.price)}`;
+                                            if (catalog.production_cost) line += `\n(Biaya produksi: ${formatCurrency(catalog.production_cost)})`;
+                                            line += '\n(Gambar tidak tersedia)';
+                                            await msg.reply(line);
+                                            // send details for non-image item
+                                            try {
+                                                let detailMsg = `*${catalog.name}*\n\n*Bahan yang digunakan:*\n`;
+                                                if (catalog.production_materials && Array.isArray(catalog.production_materials) && catalog.production_materials.length > 0) {
+                                                    for (const pm of catalog.production_materials) {
+                                                        if (pm.found) {
+                                                            const qtyText = pm.quantity !== null && pm.quantity !== undefined ? `${pm.quantity} ` : '';
+                                                            detailMsg += `• ${qtyText}${pm.matchedName || pm.name}\n`;
+                                                        } else {
+                                                            detailMsg += `• ${pm.name} (tidak dikenali)\n`;
+                                                        }
+                                                    }
+                                                } else {
+                                                    detailMsg += `• (tidak ada data bahan)\n`;
+                                                }
+                                                detailMsg += `\n*Total Cost:* ${catalog.production_cost ? formatCurrency(catalog.production_cost) : '—'}\n`;
+                                                detailMsg += `*Harga Jual:* ${formatCurrency(catalog.price)}`;
+                                                await msg.reply(detailMsg);
+                                            } catch (err) { }
+                                        }
+                                    }
+                                    results.push(`✅ Mengirim ${catalogs.length} katalog dengan harga ${formatCurrency(price)}`);
+                                }
+                            }
+                        } catch (err) {
+                            console.error('multi list_catalogs_by_price error:', err);
+                            results.push(`❌ Gagal mengambil katalog untuk price ${cmd.price}`);
+                        }
+                    } else if (cmd.type === 'add_expense') {
+                        await businessManager.addExpense(businessId, cmd.description || 'pengeluaran', cmd.amount || 0);
+                        results.push(`✅ Pengeluaran dicatat: ${formatCurrency(cmd.amount || 0)}`);
+                    } else if (cmd.type === 'add_income') {
+                        await businessManager.addIncome(businessId, cmd.description || 'pemasukan', cmd.amount || 0);
+                        results.push(`✅ Pemasukan dicatat: ${formatCurrency(cmd.amount || 0)}`);
+                    } else {
+                        results.push(`❌ Perintah tidak dikenali: ${cmd.type}`);
+                    }
+                } catch (err) {
+                    console.error('multi_command business error:', err);
+                    results.push(`❌ Gagal menjalankan ${cmd.type}: ${err.message || err}`);
+                }
+            }
+
+            const summary = results.join('\n');
+            await msg.reply(`Hasil multi-command:\n${summary}`);
+            addToChatHistory(userId, `Multi-command executed: ${results.length} items`, 'bot');
+        }
+        else if (decision.action === 'other') {
+            // Don't reply if AI doesn't understand - just skip
+            console.log('⚠️ Business mode: Action "other" - no response sent');
+            return;
+        }
+    } catch (error) {
+        console.error('❌ Business mode error:', error);
+        // Don't send generic error message - just log
+    }
+}
+
+async function handleListMaterials(msg, businessId, businessName) {
+    const materials = await businessManager.getMaterials(businessId);
+    
+    if (materials.length === 0) {
+        await msg.reply('📦 Belum ada bahan yang ditambahkan.');
+        return;
+    }
+    
+    let response = `📦 *Daftar Bahan - ${businessName}*\n\n`;
+    materials.forEach((m, i) => {
+        response += `${i + 1}. *${m.name}*\n`;
+        response += `   Per unit: ${formatCurrency(m.unit_price)}\n`;
+        if (m.pack_price) {
+            response += `   Per pack: ${formatCurrency(m.pack_price)}\n`;
+        }
+        response += '\n';
+    });
+    
+    await msg.reply(response);
+}
+
+async function handleListPriceTiers(msg, businessId, businessName) {
+    const priceTiers = await businessManager.getPriceTiers(businessId);
+    
+    if (priceTiers.length === 0) {
+        await msg.reply('💰 Belum ada harga jual yang ditambahkan.\n\nSistem akan menggunakan harga default.\nTambahkan harga jual dengan:\n"tambahkan harga jual 12000"');
+        return;
+    }
+    
+    let response = `💰 *Daftar Harga Jual - ${businessName}*\n\n`;
+    priceTiers.forEach((pt, i) => {
+        response += `${i + 1}. ${formatCurrency(pt.price)}\n`;
+    });
+    
+    await msg.reply(response);
+}
+
+async function handleAddCatalog(msg, businessId) {
+    const text = msg.body.trim();
+    
+    // Parse caption: "bunga mawar 12K"
+    const match = text.match(/(.+?)\s+(\d+[krb]*)/i);
+    if (!match) {
+        await msg.reply('❌ Format caption tidak valid. Contoh: "bunga mawar 12K"');
+        return;
+    }
+    
+    const name = match[1].trim();
+    const price = parseAmount(match[2]);
+    
+    try {
+        // Download media
+        const media = await msg.downloadMedia();
+        if (!media) {
+            await msg.reply('❌ Gagal mengunduh gambar.');
+            return;
+        }
+        
+        // Save image
+        const catalogDir = path.join(__dirname, 'business_catalogs');
+        if (!fs.existsSync(catalogDir)) {
+            fs.mkdirSync(catalogDir, { recursive: true });
+        }
+        
+        const filename = `catalog_${businessId}_${Date.now()}.${media.mimetype.split('/')[1]}`;
+        const filepath = path.join(catalogDir, filename);
+        
+        const buffer = Buffer.from(media.data, 'base64');
+        fs.writeFileSync(filepath, buffer);
+        
+        // Try to compute production cost by extracting known materials from caption
+        let productionCost = null;
+        let productionMaterials = null;
+        try {
+            const availableMaterials = await businessManager.getMaterials(businessId);
+            const normalizedCaption = normalizeName(text);
+            const found = [];
+            const foundMaterialTokens = new Set();
+            for (const m of availableMaterials) {
+                const mn = normalizeName(m.name);
+                if (normalizedCaption.includes(mn)) {
+                    // attempt to find quantity near material name
+                    const tokenRegex = mn.split(' ').map(t => t.trim()).filter(Boolean).join('\\s+');
+                    const reAfter = new RegExp(tokenRegex + '\\s*(\\d+)', 'i');
+                    const reBefore = new RegExp('(\\\d+)\\s*' + tokenRegex, 'i');
+                    let qty = 1;
+                    const matchAfter = text.match(reAfter);
+                    const matchBefore = text.match(reBefore);
+                    if (matchAfter && matchAfter[1]) qty = Number(matchAfter[1]);
+                    else if (matchBefore && matchBefore[1]) qty = Number(matchBefore[1]);
+
+                    found.push({ name: m.name, quantity: qty, unit_price: m.unit_price, pack_price: m.pack_price, per_pack: m.per_pack });
+                    mn.split(' ').forEach(t => t && foundMaterialTokens.add(t));
+                }
+            }
+
+            // Extract tokens from caption that look like potential material names but were not matched
+            const stopwords = new Set(['k','rb','ribu','per','pack','pcs','kg','g','unit','buah','pc','katalog','harga','jual']);
+            const captionTokens = normalizedCaption.split(' ').filter(Boolean);
+            const productNameTokens = normalizeName(name).split(' ').filter(Boolean);
+            const notFoundSet = new Set();
+            for (const tok of captionTokens) {
+                if (!tok) continue;
+                if (productNameTokens.includes(tok)) continue;
+                if (stopwords.has(tok)) continue;
+                if (/^\d+$/.test(tok)) continue;
+                if (foundMaterialTokens.has(tok)) continue;
+                notFoundSet.add(tok);
+            }
+
+            const notFound = Array.from(notFoundSet);
+
+            // Build productionMaterials array combining found and not-found items
+            productionMaterials = [];
+            for (const f of found) {
+                productionMaterials.push({ name: f.name, quantity: f.quantity, matchedName: f.name, unit_price: f.unit_price || null, found: true });
+            }
+            for (const nf of notFound) {
+                productionMaterials.push({ name: nf, quantity: null, matchedName: null, unit_price: null, found: false });
+            }
+
+            if (found.length > 0) {
+                // Map to calculateCost input
+                const calcInput = found.map(f => ({ unit_price: f.unit_price, quantity: f.quantity }));
+                productionCost = businessManager.calculateCost(calcInput);
+            }
+        } catch (err) {
+            console.error('Error computing production cost for catalog:', err);
+        }
+
+        // Add to database (include production cost and materials if available)
+        await businessManager.addCatalog(businessId, name, price, filepath, productionCost, productionMaterials);
+
+        let replyMsg = `✅ Katalog *${name}* berhasil ditambahkan dengan harga ${formatCurrency(price)}`;
+        if (productionCost !== null) replyMsg += `\n💵 Estimasi Biaya Produksi: ${formatCurrency(productionCost)}`;
+        await msg.reply(replyMsg);
+    } catch (error) {
+        console.error('Error adding catalog:', error);
+        await msg.reply('❌ Gagal menambahkan katalog.');
+    }
+}
+
+async function handleShowCatalogs(msg, businessId, businessName, productName = null) {
+    // If a specific productName is requested, try to find and show only that catalog
+    if (productName) {
+        // Try exact lookup first
+        let catalog = await businessManager.getCatalogByName(businessId, productName);
+
+        if (!catalog) {
+            // Fallback: fuzzy search among catalogs
+            const catalogsAll = await businessManager.getCatalogs(businessId);
+            const normTarget = normalizeName(productName);
+            catalog = catalogsAll.find(c => normalizeName(c.name) === normTarget) || catalogsAll.find(c => normalizeName(c.name).includes(normTarget)) || null;
+        }
+
+        if (!catalog) {
+            await msg.reply(`⚠️ Katalog "${productName}" tidak ditemukan.`);
+            return;
+        }
+
+        // Send the single catalog
+        try {
+            if (catalog.image_path && fs.existsSync(catalog.image_path)) {
+                const media = MessageMedia.fromFilePath(catalog.image_path);
+                let caption = `*${catalog.name}*\n💰 ${formatCurrency(catalog.price)}`;
+                if (catalog.production_cost) caption += `\n💵 Biaya produksi: ${formatCurrency(catalog.production_cost)}`;
+                await client.sendMessage(msg.from, media, { caption });
+            } else {
+                let line = `*${catalog.name}* - ${formatCurrency(catalog.price)}`;
+                if (catalog.production_cost) line += `\n(Biaya produksi: ${formatCurrency(catalog.production_cost)})`;
+                line += `\n(Gambar tidak tersedia)`;
+                await msg.reply(line);
+            }
+
+            // send details
+            let detailMsg = `*${catalog.name}*\n\n*Bahan yang digunakan:*\n`;
+            if (catalog.production_materials && Array.isArray(catalog.production_materials) && catalog.production_materials.length > 0) {
+                for (const pm of catalog.production_materials) {
+                    if (pm.found) {
+                        const qtyText = pm.quantity !== null && pm.quantity !== undefined ? `${pm.quantity} ` : '';
+                        detailMsg += `• ${qtyText}${pm.matchedName || pm.name}\n`;
+                    } else {
+                        detailMsg += `• ${pm.name} (tidak dikenali)\n`;
+                    }
+                }
+            } else {
+                detailMsg += `• (tidak ada data bahan)\n`;
+            }
+
+            detailMsg += `\n*Total Cost:* ${catalog.production_cost ? formatCurrency(catalog.production_cost) : '—'}\n`;
+            detailMsg += `*Harga Jual:* ${formatCurrency(catalog.price)}`;
+
+            await msg.reply(detailMsg);
+        } catch (err) {
+            console.error('Error sending specific catalog:', err);
+            await msg.reply(`⚠️ Gagal mengirim katalog "${productName}".`);
+        }
+
+        return;
+    }
+
+    // Default: show all catalogs (existing behavior)
+    const catalogs = await businessManager.getCatalogs(businessId);
+    
+    if (catalogs.length === 0) {
+        await msg.reply('📸 Belum ada katalog.');
+        return;
+    }
+    
+    await msg.reply(`📸 *Katalog - ${businessName}*\n\nTotal ${catalogs.length} item:\n\nMengirim katalog...`);
+    
+    // Send each catalog as separate message
+    for (let i = 0; i < catalogs.length; i++) {
+        const catalog = catalogs[i];
+        
+        if (catalog.image_path && fs.existsSync(catalog.image_path)) {
+            try {
+                const media = MessageMedia.fromFilePath(catalog.image_path);
+                let caption = `${i + 1}. *${catalog.name}*\n💰 ${formatCurrency(catalog.price)}`;
+                if (catalog.production_cost) caption += `\n💵 Biaya produksi: ${formatCurrency(catalog.production_cost)}`;
+                await client.sendMessage(msg.from, media, { caption });
+
+                // Delay to avoid rate limiting
+                if (i < catalogs.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            } catch (error) {
+                console.error(`Error sending catalog ${catalog.name}:`, error);
+                let line = `${i + 1}. *${catalog.name}* - ${formatCurrency(catalog.price)}`;
+                if (catalog.production_cost) line += `\n(Biaya produksi: ${formatCurrency(catalog.production_cost)})`;
+                line += `\n(Gambar tidak tersedia)`;
+                await msg.reply(line);
+            }
+        } else {
+            let line = `${i + 1}. *${catalog.name}* - ${formatCurrency(catalog.price)}`;
+            if (catalog.production_cost) line += `\n(Biaya produksi: ${formatCurrency(catalog.production_cost)})`;
+            line += `\n(Gambar tidak tersedia)`;
+            await msg.reply(line);
+        }
+        
+        // Send detailed breakdown (materials, total cost, selling price)
+        try {
+            let detailMsg = `*${catalog.name}*\n\n*Bahan yang digunakan:*\n`;
+            if (catalog.production_materials && Array.isArray(catalog.production_materials) && catalog.production_materials.length > 0) {
+                for (const pm of catalog.production_materials) {
+                    if (pm.found) {
+                        const qtyText = pm.quantity !== null && pm.quantity !== undefined ? `${pm.quantity} ` : '';
+                        detailMsg += `• ${qtyText}${pm.matchedName || pm.name}\n`;
+                    } else {
+                        detailMsg += `• ${pm.name} (tidak dikenali)\n`;
+                    }
+                }
+            } else {
+                detailMsg += `• (tidak ada data bahan)\n`;
+            }
+
+            detailMsg += `\n*Total Cost:* ${catalog.production_cost ? formatCurrency(catalog.production_cost) : '—'}\n`;
+            detailMsg += `*Harga Jual:* ${formatCurrency(catalog.price)}`;
+
+            await msg.reply(detailMsg);
+        } catch (err) {
+            // ignore errors when sending details
+        }
+    }
+}
+
+async function handleShowExpenses(msg, businessId, businessName) {
+    const allExpenses = await businessManager.getExpenses(businessId, true);
+    const unrecordedExpenses = allExpenses.filter(e => e.is_recorded === 0);
+    
+    if (allExpenses.length === 0) {
+        await msg.reply('📊 Belum ada pengeluaran.');
+        return;
+    }
+    
+    let response = `📊 *Pengeluaran - ${businessName}*\n\n`;
+    
+    if (unrecordedExpenses.length > 0) {
+        response += '🔴 *Belum Dicatat:*\n';
+        unrecordedExpenses.forEach((e, i) => {
+            response += `${i + 1}. ${e.description}\n`;
+            response += `   💰 ${formatCurrency(e.amount)}\n`;
+            response += `   🕐 ${formatDate(e.created_at)}\n\n`;
+        });
+    }
+    
+    const recordedExpenses = allExpenses.filter(e => e.is_recorded === 1);
+    if (recordedExpenses.length > 0) {
+        response += '✅ *Sudah Dicatat:*\n';
+        recordedExpenses.slice(0, 5).forEach((e, i) => {
+            response += `• ${e.description} - ${formatCurrency(e.amount)}\n`;
+        });
+        if (recordedExpenses.length > 5) {
+            response += `\n_...dan ${recordedExpenses.length - 5} lainnya_\n`;
+        }
+    }
+    
+    const totalExpense = allExpenses.reduce((sum, e) => sum + e.amount, 0);
+    response += `\n💵 *Total Pengeluaran: ${formatCurrency(totalExpense)}*`;
+    
+    await msg.reply(response);
+}
+
+async function handleBusinessStats(msg, businessId, businessName) {
+    const stats = await businessManager.getBusinessStats(businessId);
+    
+    let response = `📊 *Statistik Bisnis - ${businessName}*\n\n`;
+    response += `📈 Pemasukan: ${formatCurrency(stats.totalIncome)}\n`;
+    response += `📉 Pengeluaran: ${formatCurrency(stats.totalExpense)}\n`;
+    response += `💰 *Profit: ${formatCurrency(stats.profit)}*\n\n`;
+    response += `📦 Jumlah Bahan: ${stats.materialsCount}\n`;
+    response += `📸 Jumlah Katalog: ${stats.catalogsCount}\n`;
+    
+    if (stats.unrecordedExpensesCount > 0) {
+        response += `\n⚠️ ${stats.unrecordedExpensesCount} pengeluaran belum dicatat`;
+    }
+    
+    await msg.reply(response);
+}
+
+async function handleBusinessHelp(msg, businessName) {
+    // If user asked a specific question like "cara pakai ...", extract topic
+    const text = msg.body || '';
+    const topic = (() => {
+        const t = text.match(/cara pakai\s+(.+)|bagaimana cara (?:pakai\s*)?(.+)|how to use\s+(.+)/i);
+        if (t) return (t[1] || t[2] || t[3] || '').trim();
+        return null;
+    })();
+
+    try {
+        if (topic) {
+            const explanation = await explainFeature(topic, { mode: 'business', businessName });
+            await msg.reply(explanation);
+            return;
+        }
+
+        // If no specific topic, ask AI for a concise business-mode guide
+        const explanation = await explainFeature('business mode', { mode: 'business', businessName });
+        await msg.reply(explanation);
+    } catch (err) {
+        console.error('❌ Business help generation failed:', err);
+        const helpText = `🏢 *Mode Bisnis: ${businessName}*\n\nKetik "bagaimana cara pakai [fitur]" mis. "bagaimana cara pakai katalog" atau kirim "help" untuk panduan umum.`;
+        await msg.reply(helpText);
+    }
+}
+
+// Helper function to parse amount (support K, rb, ribu)
+function parseAmount(str) {
+    const cleaned = str.toLowerCase().replace(/\./g, '').replace(/,/g, '');
+    
+    if (cleaned.includes('k') && !cleaned.includes('rb')) {
+        return parseFloat(cleaned.replace('k', '')) * 1000;
+    }
+    if (cleaned.includes('rb') || cleaned.includes('ribu')) {
+        return parseFloat(cleaned.replace(/rb|ribu/g, '')) * 1000;
+    }
+    if (cleaned.includes('jt') || cleaned.includes('juta')) {
+        return parseFloat(cleaned.replace(/jt|juta/g, '')) * 1000000;
+    }
+    
+    return parseFloat(cleaned);
+}
+
+// Normalize material/catalog names for matching
+function normalizeName(s) {
+    if (!s) return '';
+    return s.toString().toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Find best matching material by name from a list of materials
+function findMaterialByName(materials, name) {
+    if (!name || !materials || materials.length === 0) return null;
+    const target = normalizeName(name);
+
+    // exact match first
+    for (const m of materials) {
+        if (normalizeName(m.name) === target) return m;
+    }
+
+    // substring match (material contains target or target contains material)
+    for (const m of materials) {
+        const mn = normalizeName(m.name);
+        if (mn.includes(target) || target.includes(mn)) return m;
+    }
+
+    // token overlap scoring
+    const targetTokens = new Set(target.split(' ').filter(Boolean));
+    let best = null;
+    let bestScore = 0;
+    for (const m of materials) {
+        const mtokens = normalizeName(m.name).split(' ').filter(Boolean);
+        let score = 0;
+        for (const t of mtokens) {
+            if (targetTokens.has(t)) score++;
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            best = m;
+        }
+    }
+
+    // Return best only if there is some overlap
+    return bestScore > 0 ? best : null;
+}
+
+// Parse freeform catalog update messages like:
+// "update daun v3,\nbahan :\n1 kawat bulu\ntfl"
+function parseCatalogUpdateText(text) {
+    if (!text) return null;
+    const t = text.trim();
+    const m = t.match(/^(?:update|perbarui|ubah)\s+([^,\n]+)(?:[,\n].*)?/i);
+    if (!m) return null;
+    let productName = m[1].trim();
+
+    // Try to extract price if it's attached to the product name like "daun v2 6000"
+    let price = null;
+    const priceInNameMatch = productName.match(/(.+?)\s+(\d[\d\.,]*(?:\s*(?:k|rb|ribu|jt|juta))?)$/i);
+    if (priceInNameMatch) {
+        productName = priceInNameMatch[1].trim();
+        try { price = parseAmount(priceInNameMatch[2]); } catch (e) { price = null; }
+    }
+
+    // Find the 'bahan' block (everything after the word 'bahan')
+    let bahanText = null;
+    const bahanMatch = t.match(/bahan\s*[:\-]?\s*([\s\S]*)/i);
+    if (bahanMatch) {
+        bahanText = bahanMatch[1].trim();
+    } else {
+        // If there's no explicit 'bahan' keyword, accept trailing content after a comma/newline
+        const afterMatch = t.match(/^(?:update|perbarui|ubah)\s+[^,\n]+[,\n]\s*([\s\S]+)/i);
+        if (afterMatch) bahanText = afterMatch[1].trim();
+    }
+
+    // Also look for an explicit 'harga' token anywhere if price not found yet
+    if (price === null) {
+        const hargaMatch = t.match(/harga\s*[:\-]?\s*(\d[\d\.,]*(?:\s*(?:k|rb|ribu|jt|juta))?)/i);
+        if (hargaMatch) {
+            try { price = parseAmount(hargaMatch[1]); } catch (e) { price = null; }
+        }
+    }
+
+    return { productName, bahanText, price };
+}
+
 // Message handler
 client.on('message', async (msg) => {
     const userId = msg.from;
@@ -113,6 +1480,114 @@ client.on('message', async (msg) => {
         // Add to chat history
         addToChatHistory(userId, text, 'user');
 
+        // Check if in business mode
+        const activeSession = await businessManager.getActiveSession(userId);
+        
+        if (activeSession) {
+            // Handle business mode commands
+            await handleBusinessMode(msg, activeSession);
+            return;
+        }
+
+        // Check if trying to enter business mode
+        if (text.toLowerCase().includes('mode bisnis') || text.toLowerCase().includes('masuk bisnis')) {
+            await handleEnterBusinessMode(msg);
+            return;
+        }
+
+        // Check if trying to create business
+        if (text.toLowerCase().includes('buat bisnis') || text.toLowerCase().includes('bisnis baru')) {
+            await handleCreateBusiness(msg);
+            return;
+        }
+
+        // Handle business creation state
+        if (client.businessCreationState && client.businessCreationState.has(userId)) {
+            const state = client.businessCreationState.get(userId);
+            
+            if (state.stage === 'waiting_credentials') {
+                // Parse username and password
+                const usernameMatch = text.match(/username:\s*(\S+)/i);
+                const passwordMatch = text.match(/password:\s*(\S+)/i);
+                
+                if (!usernameMatch || !passwordMatch) {
+                    await msg.reply('❌ Format tidak valid. Silakan kirim:\nusername: [username]\npassword: [password]');
+                    return;
+                }
+                
+                const username = usernameMatch[1];
+                const password = passwordMatch[1];
+                
+                try {
+                    await businessManager.createBusiness(userId, state.businessName, username, password, state.description);
+                    await msg.reply(`✅ Bisnis *${state.businessName}* berhasil dibuat!\n\nUntuk masuk ke mode bisnis, ketik:\n"mode bisnis"`);
+                    client.businessCreationState.delete(userId);
+                } catch (error) {
+                    if (error.message === 'BUSINESS_ALREADY_EXISTS') {
+                        await msg.reply(`⚠️ Bisnis *${state.businessName}* sudah ada.`);
+                    } else {
+                        await msg.reply('❌ Gagal membuat bisnis.');
+                    }
+                    client.businessCreationState.delete(userId);
+                }
+                return;
+            }
+        }
+
+        // Handle business login state
+        if (client.businessLoginState && client.businessLoginState.has(userId)) {
+            const state = client.businessLoginState.get(userId);
+            
+            if (state.stage === 'waiting_business_name') {
+                // Allow entering any existing business name (not only user's own business)
+                const business = await businessManager.getBusinessByNameAny(text);
+
+                if (!business) {
+                    await msg.reply(`❌ Bisnis *${text}* tidak ditemukan.`);
+                    client.businessLoginState.delete(userId);
+                    return;
+                }
+
+                // Ask for credentials
+                await msg.reply(`🔐 *Login ke ${business.name}*\n\nSilakan kirim username dan password dengan format:\nusername: [username]\npassword: [password]`);
+
+                state.stage = 'waiting_credentials';
+                state.businessId = business.id;
+                state.businessName = business.name;
+                client.businessLoginState.set(userId, state);
+                return;
+            }
+            
+            if (state.stage === 'waiting_credentials') {
+                // Parse username and password
+                const usernameMatch = text.match(/username:\s*(\S+)/i);
+                const passwordMatch = text.match(/password:\s*(\S+)/i);
+                
+                if (!usernameMatch || !passwordMatch) {
+                    await msg.reply('❌ Format tidak valid. Silakan kirim:\nusername: [username]\npassword: [password]');
+                    return;
+                }
+                
+                const username = usernameMatch[1];
+                const password = passwordMatch[1];
+                
+                // Verify credentials across businesses (returns business row on success)
+                const matchedBusiness = await businessManager.verifyBusinessCredentials(userId, state.businessName, username, password);
+
+                if (!matchedBusiness) {
+                    await msg.reply('❌ Username atau password salah.');
+                    client.businessLoginState.delete(userId);
+                    return;
+                }
+
+                // Start business session for this user with the matched business id
+                await businessManager.startBusinessSession(userId, matchedBusiness.id);
+                await msg.reply(`✅ *Masuk ke Mode Bisnis: ${state.businessName}*\n\nKetik "help" untuk melihat perintah yang tersedia.\nKetik "keluar" untuk kembali ke mode personal.`);
+                client.businessLoginState.delete(userId);
+                return;
+            }
+        }
+
         // Get user wallets for AI context
         const userWallets = await financeManager.getWallets(userId);
 
@@ -123,7 +1598,7 @@ client.on('message', async (msg) => {
         const decision = await aiDecideAction(text, history, userWallets);
         
         if (!decision) {
-            await msg.reply('❌ Maaf, saya tidak bisa memproses pesan Anda. Ketik "help" untuk bantuan.');
+            console.log('⚠️ Personal mode: AI returned null - no response sent');
             return;
         }
         
@@ -132,6 +1607,51 @@ client.on('message', async (msg) => {
         
         // Execute action based on AI decision
         try {
+        if (decision.action === 'list_catalogs_by_price') {
+            const price = decision.params?.price;
+            if (!price && price !== 0) {
+                await msg.reply('❌ Harap sebutkan harga yang ingin dicari. Contoh: "list katalog harga jual 12k"');
+                return;
+            }
+
+            try {
+                const catalogs = await businessManager.getCatalogsByPrice(businessId, price);
+                if (!catalogs || catalogs.length === 0) {
+                    await msg.reply(`📸 Tidak ada katalog dengan harga jual ${formatCurrency(price)}.`);
+                    return;
+                }
+
+                await msg.reply(`📸 *Katalog dengan Harga ${formatCurrency(price)} - ${businessName}*\n\nTotal ${catalogs.length} item:\n\nMengirim katalog...`);
+                for (let i = 0; i < catalogs.length; i++) {
+                    const catalog = catalogs[i];
+                    if (catalog.image_path && fs.existsSync(catalog.image_path)) {
+                        try {
+                            const media = MessageMedia.fromFilePath(catalog.image_path);
+                            let caption = `${i + 1}. *${catalog.name}*\n💰 ${formatCurrency(catalog.price)}`;
+                            if (catalog.production_cost) caption += `\n💵 Biaya produksi: ${formatCurrency(catalog.production_cost)}`;
+                            await client.sendMessage(msg.from, media, { caption });
+                            if (i < catalogs.length - 1) await new Promise(res => setTimeout(res, 1000));
+                        } catch (err) {
+                            console.error('Error sending catalog item:', err);
+                            let line = `${i + 1}. *${catalog.name}* - ${formatCurrency(catalog.price)}`;
+                            if (catalog.production_cost) line += `\n(Biaya produksi: ${formatCurrency(catalog.production_cost)})`;
+                            line += `\n(Gambar tidak tersedia)`;
+                            await msg.reply(line);
+                        }
+                    } else {
+                        let line = `${i + 1}. *${catalog.name}* - ${formatCurrency(catalog.price)}`;
+                        if (catalog.production_cost) line += `\n(Biaya produksi: ${formatCurrency(catalog.production_cost)})`;
+                        line += `\n(Gambar tidak tersedia)`;
+                        await msg.reply(line);
+                    }
+                }
+            } catch (err) {
+                console.error('list_catalogs_by_price error:', err);
+                await msg.reply('❌ Gagal mengambil katalog berdasarkan harga.');
+            }
+
+            return;
+        }
             if (decision.action === 'check_balance') {
                 const balance = await financeManager.getBalance(userId);
                 const wallets = await financeManager.getWallets(userId);
@@ -495,43 +2015,25 @@ client.on('message', async (msg) => {
                 addToChatHistory(userId, response, 'bot');
             }
             else if (decision.action === 'help') {
-                const helpText = `🤖 *Bot Keuangan - Bantuan*
+                // Determine topic from AI params or message text
+                const topic = decision.params?.topic || (() => {
+                    const t = text.match(/cara pakai\s+(.+)|bagaimana cara (?:pakai\s*)?(.+)|how to use\s+(.+)/i);
+                    if (t) return (t[1] || t[2] || t[3] || '').trim();
+                    return null;
+                })();
 
-📊 *Cek Saldo:*
-• "saldo" - total saldo
-• "saldo tabungan" - saldo wallet tertentu
-
-📝 *Transaksi:*
-• "dapat gaji 5jt"
-• "beli makan 25rb"
-• "transfer 100rb ke tabungan"
-
-🏦 *Kantong:*
-• "buatkan kantong cash"
-• "buat kantong tabungan"
-• "daftar kantong"
-
-📋 *Riwayat & Statistik:*
-• "riwayat" - 10 transaksi terakhir
-• "statistik" - laporan bulan ini
-
-⚖️ *Penyesuaian Saldo:*
-• "tabungan saya sekarang 1.5jt"
-Bot akan otomatis adjust jika beda
-
-💾 *Backup Database:*
-• "saya mau database nya"
-• "backup database"
-
-📊 *Export Excel:*
-• "export excel" - semua transaksi bulan ini
-• "export pengeluaran" - pengeluaran bulan ini
-• "export pemasukan hari ini" - pemasukan hari ini
-• "export semua transaksi" - semua transaksi
-
-_Semua perintah diproses dengan AI - cukup chat natural!_`;
-                
-                await msg.reply(helpText);
+                try {
+                    if (topic) {
+                        const explanation = await explainFeature(topic, { mode: 'personal' });
+                        await msg.reply(explanation);
+                    } else {
+                        const explanation = await explainFeature(null, { mode: 'personal' });
+                        await msg.reply(explanation);
+                    }
+                } catch (err) {
+                    console.error('❌ Help generation failed:', err);
+                    await msg.reply('🤖 Bantuan: silakan tulis "bagaimana cara pakai [fitur]" atau ketik "help" untuk panduan singkat.');
+                }
             }
             else if (decision.action === 'backup_database') {
                 await msg.reply('⏳ Sedang membuat backup database...');
@@ -622,8 +2124,18 @@ _Semua perintah diproses dengan AI - cukup chat natural!_`;
                     await msg.reply(`❌ Gagal export Excel: ${error.message}`);
                 }
             }
+            else if (decision.action === 'create_business') {
+                // Route to business creation flow
+                await handleCreateBusiness(msg, decision.params);
+            }
+            else if (decision.action === 'enter_business_mode') {
+                // Route to business mode login
+                await handleEnterBusinessMode(msg);
+            }
             else if (decision.action === 'other') {
-                await msg.reply('❓ Maaf, saya kurang paham. Ketik "help" untuk melihat panduan.');
+                // Don't reply if AI doesn't understand - just skip
+                console.log('⚠️ Personal mode: Action "other" - no response sent');
+                return;
             }
             else if (decision.action === 'multi_command') {
                 // Handle multiple commands in sequence
@@ -703,7 +2215,8 @@ _Semua perintah diproses dengan AI - cukup chat natural!_`;
             } else if (error.message === 'TO_WALLET_NOT_FOUND') {
                 await msg.reply('❌ Kantong tujuan tidak ditemukan.');
             } else {
-                await msg.reply('❌ Terjadi kesalahan. Ketik "help" untuk bantuan.');
+                // Don't send generic error message - just log
+                console.error('❌ Unhandled error:', error.message);
             }
         }
     } catch (error) {
