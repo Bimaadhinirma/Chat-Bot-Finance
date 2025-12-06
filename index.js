@@ -259,7 +259,7 @@ client.on('message', async (msg) => {
             return;
         }
 
-        if (decision.action === 'statistics' || decision.action === 'show_statistics') {
+        if (decision.action === 'statistics' || decision.action === 'show_stats') {
             try {
                 const period = decision.params.period || 'this_month';
                 const month = decision.params.month;
