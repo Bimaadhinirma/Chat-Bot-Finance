@@ -223,6 +223,102 @@ client.on('message', async (msg) => {
             return;
         }
 
+        if (decision.action === 'history') {
+            try {
+                const period = decision.params.period || 'this_month';
+                const month = decision.params.month;
+                const limit = decision.params.limit || 20;
+
+                let transactions = [];
+                if (period === 'today') transactions = await financeManager.getHistoryByPeriod(userId, 'today', null, limit);
+                else if (period === 'this_month') transactions = await financeManager.getHistoryByPeriod(userId, 'this_month', null, limit);
+                else if (period === 'last_month') transactions = await financeManager.getHistoryByPeriod(userId, 'last_month', null, limit);
+                else if (period === 'specific_month' && month) transactions = await financeManager.getHistoryByPeriod(userId, 'specific_month', month, limit);
+                else transactions = await financeManager.getHistoryByPeriod(userId, 'all_time', null, limit);
+
+                if (!transactions || transactions.length === 0) {
+                    await msg.reply('📋 Belum ada transaksi.');
+                    return;
+                }
+
+                let response = `📋 *Riwayat Transaksi*\n\n`;
+                transactions.forEach((t, i) => {
+                    const icon = t.type === 'income' ? '💰' : '💸';
+                    const sign = t.type === 'income' ? '+' : '-';
+                    response += `${i + 1}. ${icon} ${sign}${formatCurrency(t.amount)}\n`;
+                    response += `   ${t.description}\n`;
+                    response += `   📁 ${t.wallet_name} | ${formatDate(t.created_at)}\n\n`;
+                });
+
+                await msg.reply(response);
+                addToChatHistory(userId, response, 'bot');
+            } catch (err) {
+                console.error('History error:', err);
+                await msg.reply(`❌ Gagal mengambil riwayat: ${err.message}`);
+            }
+            return;
+        }
+
+        if (decision.action === 'statistics') {
+            try {
+                const period = decision.params.period || 'this_month';
+                const month = decision.params.month;
+
+                let stats;
+                let categoryStats = [];
+                let periodLabel = '';
+
+                if (period === 'today') {
+                    stats = await financeManager.getDailyStats(userId);
+                    categoryStats = await financeManager.getDailyCategoryStats(userId);
+                    periodLabel = 'Hari Ini';
+                } else if (period === 'this_month') {
+                    stats = await financeManager.getMonthlyStats(userId);
+                    categoryStats = await financeManager.getCategoryStats(userId);
+                    const now = new Date();
+                    periodLabel = `Bulan ${now.toLocaleString('id-ID', { month: 'long', year: 'numeric' })}`;
+                } else if (period === 'last_month') {
+                    const lastMonth = new Date();
+                    lastMonth.setMonth(lastMonth.getMonth() - 1);
+                    const yearMonth = lastMonth.toISOString().slice(0, 7);
+                    stats = await financeManager.getMonthlyStatsByMonth(userId, yearMonth);
+                    categoryStats = await financeManager.getCategoryStatsByMonth(userId, yearMonth);
+                    periodLabel = `Bulan ${lastMonth.toLocaleString('id-ID', { month: 'long', year: 'numeric' })}`;
+                } else if (period === 'specific_month' && month) {
+                    stats = await financeManager.getMonthlyStatsByMonth(userId, month);
+                    categoryStats = await financeManager.getCategoryStatsByMonth(userId, month);
+                    const [year, monthNum] = month.split('-');
+                    const date = new Date(year, parseInt(monthNum) - 1);
+                    periodLabel = `Bulan ${date.toLocaleString('id-ID', { month: 'long', year: 'numeric' })}`;
+                } else { // all_time
+                    stats = await financeManager.getAllTimeStats(userId);
+                    categoryStats = await financeManager.getCategoryStats(userId);
+                    periodLabel = 'Sepanjang Waktu';
+                }
+
+                let response = `📊 *Statistik ${periodLabel}*\n\n`;
+                response += `💰 Pemasukan: ${formatCurrency(stats.income)} (${stats.incomeCount}×)\n`;
+                response += `💸 Pengeluaran: ${formatCurrency(stats.expense)} (${stats.expenseCount}×)\n`;
+                const diff = stats.income - stats.expense;
+                const diffIcon = diff >= 0 ? '✅' : '⚠️';
+                response += `${diffIcon} Selisih: ${formatCurrency(diff)}\n`;
+
+                if (categoryStats && categoryStats.length > 0) {
+                    response += `\n📂 *Per Kategori:*\n`;
+                    categoryStats.forEach((cat, i) => {
+                        response += `${i + 1}. ${cat.category}: ${formatCurrency(cat.total)} (${cat.count}×)\n`;
+                    });
+                }
+
+                await msg.reply(response);
+                addToChatHistory(userId, response, 'bot');
+            } catch (err) {
+                console.error('Statistics error:', err);
+                await msg.reply(`❌ Gagal mengambil statistik: ${err.message}`);
+            }
+            return;
+        }
+
         if (decision.action === 'export_excel') {
             await msg.reply('⏳ Sedang membuat file Excel...');
             try {
