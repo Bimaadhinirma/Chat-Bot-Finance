@@ -100,7 +100,7 @@ AVAILABLE ACTIONS:
     - "statistik bulan ini" → period: "this_month"
     - "statistik bulan lalu" → period: "last_month"
     - "statistik bulan januari" atau "statistik bulan 1" → period: "specific_month", month: "2025-01"
-    - "statistik selama ini" atau "statistik semua" → period: "all_time"
+    - "statistik selama ini", "statistik semua", "statistik 2 bulan terakhir", "statistik beberapa bulan" → period: "all_time"
    
 14. "show_wallets" - Tampilkan daftar wallet
 
@@ -128,6 +128,8 @@ LOGIC RULES:
 - Jika user minta "backup database", "saya mau database nya", "kirim database" → ACTION: backup_database
 - DEFAULT statistik adalah HARI INI, bukan bulan ini
 - "statistik bulan 6" → specific_month dengan month: "2025-06"
+- "statistik januari" atau "statistik bulan januari" → specific_month dengan month: "2025-01"
+- "statistik 2 bulan terakhir", "statistik beberapa bulan", "statistik selama ini" → all_time (akan menampilkan semua data sejak awal)
 - "statistik januari" atau "statistik bulan januari" → specific_month dengan month: "2025-01"
 - Parse angka: "1jt 500" = 1500000, "50rb" = 50000, "5jt" = 5000000, "2500" = 2500
 - Parse tanggal: "kemarin" = 2025-11-25, "tanggal 24" = 2025-11-24, "24 november" = 2025-11-24
@@ -756,14 +758,15 @@ ATURAN:
    - Jika tidak ada petunjuk jelas, tetap coba deteksi berdasarkan konteks:
      * Transfer/Gaji/Pembayaran digital → "rekening"
      * Belanja fisik/Jajan/Bensin → "cash"
-6. Untuk EXPENSE, kategorikan otomatis:
-   - "makanan" untuk makan, jajan, snack, minuman, restoran
-   - "transportasi" untuk bensin, ojek, taxi, parkir, tol
-   - "belanja" untuk beli barang, shopping
-   - "tagihan" untuk bayar listrik, air, internet, pulsa
-   - "hiburan" untuk nonton, game, traveling
-   - "kebutuhan" untuk keperluan penting
-   - "lainnya" untuk yang tidak jelas
+6. Untuk EXPENSE, kategorikan otomatis dan NORMALISASI kategori:
+   - "makanan" untuk: makan, jajan, snack, minuman, restoran, sarapan, makan siang, makan malam, lunch, dinner, breakfast, cafe, warung, bakso, nasi goreng, dll
+   - "transportasi" untuk: bensin, ojek, taxi, parkir, tol, grab, gojek, angkot, bus, kereta
+   - "belanja" untuk: beli barang, shopping, belanja bulanan, market
+   - "tagihan" untuk: bayar listrik, air, internet, pulsa, wifi, token
+   - "hiburan" untuk: nonton, game, traveling, liburan, konser
+   - "kebutuhan" untuk: keperluan penting, obat, kos, sewa
+   - "lainnya" untuk: yang tidak jelas
+   PENTING: Gunakan LOWERCASE untuk kategori (makanan, bukan Makanan)
 
 CONTOH INPUT DAN OUTPUT:
 - "ditransfer 1jt" → {"type":"income","amount":1000000,"description":"Ditransfer uang","wallet":"rekening"}

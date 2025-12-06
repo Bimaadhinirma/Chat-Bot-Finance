@@ -9,6 +9,56 @@ class FinanceManager {
     }
 
     /**
+     * Normalize category untuk konsistensi
+     */
+    normalizeCategory(category) {
+        if (!category) return 'lainnya';
+        
+        const normalized = category.toLowerCase().trim();
+        
+        // Mapping kategori makanan
+        const foodKeywords = ['makan', 'jajan', 'snack', 'minum', 'restoran', 'sarapan', 
+                             'lunch', 'dinner', 'breakfast', 'cafe', 'warung', 'bakso', 
+                             'nasi', 'soto', 'ayam', 'bebek', 'ikan', 'seafood', 'burger',
+                             'pizza', 'ramen', 'sushi', 'kopi', 'teh', 'susu', 'juice'];
+        
+        // Mapping kategori transportasi
+        const transportKeywords = ['bensin', 'ojek', 'taxi', 'parkir', 'tol', 'grab', 
+                                  'gojek', 'angkot', 'bus', 'kereta', 'motor', 'mobil',
+                                  'transport', 'ongkos', 'bbm', 'solar'];
+        
+        // Mapping kategori tagihan
+        const billKeywords = ['listrik', 'air', 'internet', 'pulsa', 'wifi', 'token',
+                             'pdam', 'pln', 'bayar', 'cicil', 'angsuran'];
+        
+        // Mapping kategori hiburan
+        const entertainmentKeywords = ['nonton', 'game', 'traveling', 'liburan', 'konser',
+                                      'bioskop', 'wisata', 'tour', 'hotel', 'penginapan'];
+        
+        // Mapping kategori belanja
+        const shoppingKeywords = ['belanja', 'shopping', 'beli', 'pasar', 'supermarket',
+                                 'market', 'indomaret', 'alfamart'];
+        
+        // Mapping kategori kebutuhan
+        const needsKeywords = ['obat', 'kos', 'sewa', 'rumah', 'kontrakan', 'laundry',
+                              'cuci', 'potong', 'salon', 'dokter', 'kesehatan'];
+        
+        // Check kategori
+        if (foodKeywords.some(keyword => normalized.includes(keyword))) return 'makanan';
+        if (transportKeywords.some(keyword => normalized.includes(keyword))) return 'transportasi';
+        if (billKeywords.some(keyword => normalized.includes(keyword))) return 'tagihan';
+        if (entertainmentKeywords.some(keyword => normalized.includes(keyword))) return 'hiburan';
+        if (shoppingKeywords.some(keyword => normalized.includes(keyword))) return 'belanja';
+        if (needsKeywords.some(keyword => normalized.includes(keyword))) return 'kebutuhan';
+        
+        // Return as-is if already standard category
+        const standardCategories = ['makanan', 'transportasi', 'tagihan', 'hiburan', 'belanja', 'kebutuhan', 'lainnya'];
+        if (standardCategories.includes(normalized)) return normalized;
+        
+        return 'lainnya';
+    }
+
+    /**
      * Buat wallet baru atau ambil yang sudah ada
      */
     getOrCreateWallet(userId, walletName) {
@@ -406,6 +456,7 @@ class FinanceManager {
      */
     addExpense(userId, amount, description, walletName = 'cash', category = 'lainnya', customDate = null) {
         const normalizedName = this.normalizeWalletName(walletName);
+        const normalizedCategory = this.normalizeCategory(category);
         return new Promise(async (resolve, reject) => {
             try {
                 // Validasi wallet exist
@@ -418,7 +469,7 @@ class FinanceManager {
                 
                 db.run(
                     'INSERT INTO transactions (user_id, wallet_name, type, amount, category, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    [userId, normalizedName, 'expense', amount, category, description, dateValue],
+                    [userId, normalizedName, 'expense', amount, normalizedCategory, description, dateValue],
                     function(err) {
                         if (err) return reject(err);
                         

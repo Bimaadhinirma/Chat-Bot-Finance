@@ -292,6 +292,7 @@ client.on('message', async (msg) => {
                     periodLabel = `Bulan ${date.toLocaleString('id-ID', { month: 'long', year: 'numeric' })}`;
                 } else if (period === 'all_time') {
                     stats = await financeManager.getAllTimeStats(userId);
+                    categoryStats = await financeManager.getCategoryStats(userId);
                     const monthlyTrends = await financeManager.getMonthlyTrends(userId);
                     const firstTx = await financeManager.getFirstTransactionDate(userId);
                     
@@ -301,6 +302,25 @@ client.on('message', async (msg) => {
                         const monthsDiff = (now.getFullYear() - firstDate.getFullYear()) * 12 + (now.getMonth() - firstDate.getMonth()) + 1;
                         
                         periodLabel = `Sepanjang Waktu (${monthsDiff} bulan)`;
+                        
+                        // Generate response with category percentages
+                        let response = `📊 *Statistik ${periodLabel}*\n\n`;
+                        response += `💰 Pemasukan: ${formatCurrency(stats.income)} (${stats.incomeCount}×)\n`;
+                        response += `💸 Pengeluaran: ${formatCurrency(stats.expense)} (${stats.expenseCount}×)\n`;
+                        const diff = stats.income - stats.expense;
+                        const diffIcon = diff >= 0 ? '✅' : '⚠️';
+                        response += `${diffIcon} Selisih: ${formatCurrency(diff)}\n`;
+                        
+                        if (categoryStats && categoryStats.length > 0) {
+                            response += `\n📂 *Pengeluaran per Kategori:*\n`;
+                            const totalExpense = categoryStats.reduce((sum, cat) => sum + cat.total, 0);
+                            categoryStats.forEach((cat, i) => {
+                                const percentage = ((cat.total / totalExpense) * 100).toFixed(1);
+                                response += `${i + 1}. ${cat.category}: ${formatCurrency(cat.total)} (${percentage}%)\n`;
+                            });
+                        }
+                        
+                        await msg.reply(response);
                         
                         // Generate combo chart for all-time stats
                         if (Object.keys(monthlyTrends).length > 0) {
@@ -321,14 +341,17 @@ client.on('message', async (msg) => {
                             
                             await client.sendMessage(userId, chartMedia, { caption });
                             addToChatHistory(userId, caption, 'bot');
-                            return;
                         }
+                        return;
                     } else {
                         periodLabel = 'Sepanjang Waktu';
                     }
                     
                     categoryStats = await financeManager.getCategoryStats(userId);
                 } else {
+                    // Default to today if period not recognized
+                    stats = await financeManager.getDailyStats(userId);
+                    categoryStats = await financeManager.getDailyCategoryStats(userId);
                     periodLabel = 'Hari Ini';
                 }
 
