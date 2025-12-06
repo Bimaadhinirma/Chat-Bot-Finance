@@ -261,7 +261,7 @@ client.on('message', async (msg) => {
 
         if (decision.action === 'statistics' || decision.action === 'show_stats') {
             try {
-                const period = decision.params.period || 'this_month';
+                const period = decision.params.period || 'today';
                 const month = decision.params.month;
 
                 let stats;
@@ -290,10 +290,46 @@ client.on('message', async (msg) => {
                     const [year, monthNum] = month.split('-');
                     const date = new Date(year, parseInt(monthNum) - 1);
                     periodLabel = `Bulan ${date.toLocaleString('id-ID', { month: 'long', year: 'numeric' })}`;
-                } else { // all_time
+                } else if (period === 'all_time') {
                     stats = await financeManager.getAllTimeStats(userId);
+                    const monthlyTrends = await financeManager.getMonthlyTrends(userId);
+                    const firstTx = await financeManager.getFirstTransactionDate(userId);
+                    
+                    if (firstTx) {
+                        const firstDate = new Date(firstTx);
+                        const now = new Date();
+                        const monthsDiff = (now.getFullYear() - firstDate.getFullYear()) * 12 + (now.getMonth() - firstDate.getMonth()) + 1;
+                        
+                        periodLabel = `Sepanjang Waktu (${monthsDiff} bulan)`;
+                        
+                        // Generate combo chart for all-time stats
+                        if (Object.keys(monthlyTrends).length > 0) {
+                            await msg.reply('⏳ Sedang membuat chart...');
+                            
+                            const chartMedia = await chartGenerator.generateMonthlyTrendsChartMedia(
+                                monthlyTrends,
+                                stats.income,
+                                stats.expense
+                            );
+                            
+                            const caption = chartGenerator.generateTrendsCaption(
+                                monthlyTrends,
+                                stats.income,
+                                stats.expense,
+                                monthsDiff
+                            );
+                            
+                            await client.sendMessage(userId, chartMedia, { caption });
+                            addToChatHistory(userId, caption, 'bot');
+                            return;
+                        }
+                    } else {
+                        periodLabel = 'Sepanjang Waktu';
+                    }
+                    
                     categoryStats = await financeManager.getCategoryStats(userId);
-                    periodLabel = 'Sepanjang Waktu';
+                } else {
+                    periodLabel = 'Hari Ini';
                 }
 
                 let response = `📊 *Statistik ${periodLabel}*\n\n`;
@@ -308,6 +344,29 @@ client.on('message', async (msg) => {
                     categoryStats.forEach((cat, i) => {
                         response += `${i + 1}. ${cat.category}: ${formatCurrency(cat.total)} (${cat.count}×)\n`;
                     });
+                    
+                    // Generate pie chart for period-based stats (not all_time)
+                    if (period !== 'all_time') {
+                        await msg.reply(response);
+                        await msg.reply('⏳ Sedang membuat chart...');
+                        
+                        const chartMedia = await chartGenerator.generateExpenseChartMedia(
+                            categoryStats,
+                            stats.income,
+                            stats.expense,
+                            periodLabel
+                        );
+                        
+                        const chartCaption = chartGenerator.generateCaption(
+                            categoryStats,
+                            stats.income,
+                            stats.expense
+                        );
+                        
+                        await client.sendMessage(userId, chartMedia, { caption: chartCaption });
+                        addToChatHistory(userId, chartCaption, 'bot');
+                        return;
+                    }
                 }
 
                 await msg.reply(response);
